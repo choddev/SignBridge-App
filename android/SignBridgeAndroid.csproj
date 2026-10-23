@@ -11,6 +11,7 @@
     <AndroidPackageFormat>apk</AndroidPackageFormat>
   </PropertyGroup>
   <ItemGroup>
+    <AndroidAsset Include="..\models\yolo11n.pt" Link="Assets\yolo11n.pt" />
     <AndroidAsset Include="..\models\data.yaml" Link="Assets\data.yaml" />
   </ItemGroup>
 </Project>

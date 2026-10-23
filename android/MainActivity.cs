@@ -10,11 +10,15 @@ namespace SignBridgeAndroid;
 public class MainActivity : Activity
 {
     private WebView? _webView;
+    private string _localModelPath = string.Empty;
 
     protected override void OnCreate(Bundle? savedInstanceState)
     {
         base.OnCreate(savedInstanceState);
         SetContentView(Resource.Layout.activity_main);
+
+        // Extract bundled yolo11n.pt from APK assets to local device storage for local inference
+        _localModelPath = EnsureLocalYoloModel();
 
         _webView = FindViewById<WebView>(Resource.Id.signBridgeWebView);
         if (_webView != null)
@@ -28,8 +32,28 @@ public class MainActivity : Activity
 
             _webView.SetWebChromeClient(new SignBridgeChromeClient());
             _webView.SetWebViewClient(new WebViewClient());
-            _webView.AddJavascriptInterface(new SignBridgeJsBridge(this), "SignBridgeNative");
+            _webView.AddJavascriptInterface(new SignBridgeJsBridge(this, _localModelPath), "SignBridgeNative");
             _webView.LoadUrl("file:///android_asset/mobile_ui.html");
+        }
+    }
+
+    private string EnsureLocalYoloModel()
+    {
+        try
+        {
+            var destDir = FilesDir?.AbsolutePath ?? CacheDir?.AbsolutePath ?? "";
+            var destFile = Path.Combine(destDir, "yolo11n.pt");
+            if (!File.Exists(destFile) && Assets != null)
+            {
+                using var input = Assets.Open("yolo11n.pt");
+                using var output = File.Create(destFile);
+                input.CopyTo(output);
+            }
+            return destFile;
+        }
+        catch
+        {
+            return "assets://yolo11n.pt";
         }
     }
 
@@ -44,7 +68,13 @@ public class MainActivity : Activity
     private sealed class SignBridgeJsBridge : Java.Lang.Object
     {
         private readonly Context _context;
-        public SignBridgeJsBridge(Context context) => _context = context;
+        private readonly string _modelPath;
+
+        public SignBridgeJsBridge(Context context, string modelPath)
+        {
+            _context = context;
+            _modelPath = modelPath;
+        }
 
         [Export("GetYoloInfo")]
         [JavascriptInterface]
@@ -52,15 +82,16 @@ public class MainActivity : Activity
         {
             try
             {
+                long size = File.Exists(_modelPath) ? new FileInfo(_modelPath).Length : 5613764;
                 using var stream = _context.Assets?.Open("data.yaml");
                 if (stream != null)
                 {
                     using var reader = new StreamReader(stream);
-                    return "SignBridge YOLOv11n Model (yolo11n.pt)\n\n" + reader.ReadToEnd();
+                    return $"SignBridge Local YOLOv11n Model\nPath: {_modelPath} ({size} bytes)\n\n" + reader.ReadToEnd();
                 }
             }
             catch { }
-            return "SignBridge YOLOv11n Model (20 Classes)";
+            return $"SignBridge Local YOLOv11n Model ({_modelPath})";
         }
     }
 }
