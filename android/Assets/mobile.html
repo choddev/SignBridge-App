@@ -104,11 +104,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <div id="camera-tab" class="tab-content active">
     <div class="header">
       <span class="logo">SignBridge</span>
-      <span class="badge">Kamera</span><button onclick="flipCamera()" style="margin-left:auto;padding:4px 10px;border-radius:8px;border:1px solid #334155;background:#1e293b;color:#e2e8f0;font-size:.72rem;font-weight:600;cursor:pointer;">?? Kamera</button>
+      <span class="badge">122 Kelime</span>
+      <button id="btn-demo" onclick="toggleDemoMode()" style="margin-left:auto;padding:4px 10px;border-radius:8px;border:1px solid #155e75;background:rgba(6,182,212,0.12);color:#22d3ee;font-size:.70rem;font-weight:700;cursor:pointer;">🎯 Demo (29)</button>
+      <button onclick="flipCamera()" style="padding:4px 10px;border-radius:8px;border:1px solid #334155;background:#1e293b;color:#e2e8f0;font-size:.72rem;font-weight:600;cursor:pointer;">🔄 Kamera</button>
     </div>
     <div id="video-wrap">
-      <video id="cam-video" autoplay playsinline muted></video>
+      <video id="cam-video" autoplay playsinline muted style="transform:scaleX(-1)"></video>
       <canvas id="cam-canvas"></canvas>
+      <canvas id="lm-canvas" style="display:block;position:absolute;inset:0;width:100%;height:100%;pointer-events:none;"></canvas>
       <div id="cam-overlay">
         <div id="cam-top">
           <div id="cam-status">Kamera baslatiliyor...</div>
@@ -116,7 +119,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         </div>
         <div id="cam-bottom">
           <div id="sentence-box">
-            <div id="sentence-label">Taninen Kelimeler</div>
+            <div id="sentence-label" style="display:flex;justify-content:space-between;align-items:center;">
+              <span>Tanınan Kelimeler</span>
+              <span id="live-pred-badge" style="font-size:.72rem;color:#a78bfa;font-weight:800;text-transform:none;"></span>
+            </div>
             <div id="sentence-words"></div>
             <div id="sentence-turkish"></div>
             <div id="cam-actions">
@@ -168,7 +174,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </div>
 </div>
 
-<!-- ═══════════════ CAMERA LOGIC ═══════════════ -->
+<!-- ═══════════════ MEDIAPIPE HOLISTIC + CAMERA LOGIC ═══════════════ -->
+<script src="/holistic/holistic.js"></script>
 <script>
 // ── Tab switching ──
 function switchTab(tab){
@@ -206,10 +213,12 @@ function installPWA(){
   });
 }
 
-// ── Camera ──
+// ── Camera & Real MediaPipe Holistic + V2 GRU Inference ──
 const video=document.getElementById('cam-video');
 const canvas=document.getElementById('cam-canvas');
 const ctx=canvas.getContext('2d');
+const lmCanvas=document.getElementById('lm-canvas');
+const lmCtx=lmCanvas.getContext('2d');
 let camStream=null;
 let camRunning=false;
 let sentenceWords=[];
@@ -221,69 +230,311 @@ let fps=0;
 let lastAddedWord='';
 let sameWordCount=0;
 let pastSentences=[];
-// V2 backend ile uyumlu
-const CONF_THRESHOLD=0.82;   // normal esik
-const CONF_FAST_TRACK=0.94;  // fast-track esik
-// Smoothing: require same prediction N times before accepting
+let demoMode=false;
+
+// V2 backend ile uyumlu stabilizasyon eşikleri
+const CONF_THRESHOLD=0.88;   // normal esik
+const CONF_FAST_TRACK=0.95;  // fast-track esik
+const MARGIN_FAST=0.45;
 let smoothWord='';
 let smoothCount=0;
-const SMOOTH_NEEDED=4;       // normal: 4 frame
-const SMOOTH_FAST=2;         // fast: 2 frame (takir takir)
+const SMOOTH_NEEDED=3;       // normal: 3 frame
+const SMOOTH_FAST=2;         // fast: 2 frame
 const SAME_WORD_MAX=3;
 let lastWordTime=0;
-const MIN_WORD_GAP=500;      // backend COOLDOWN_SEC=0.5s
+const MIN_WORD_GAP=800;      // COOLDOWN_SEC=0.8s
+
+function toggleDemoMode(){
+  demoMode=!demoMode;
+  const btn=document.getElementById('btn-demo');
+  if(btn){
+    btn.style.background=demoMode?'rgba(6,182,212,0.35)':'rgba(6,182,212,0.12)';
+    btn.style.color=demoMode?'#fff':'#22d3ee';
+    btn.textContent=demoMode?'🎯 Demo: Açık':'🎯 Demo (29)';
+  }
+  smoothWord='';
+  smoothCount=0;
+}
+
+// ── MediaPipe Holistic Setup ──
+let holisticInstance=null;
+let holisticReady=false;
+let holisticBusy=false;
+let useLocalHolistic=false;
+
+const HAND_CONNECTIONS=[
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[0,17],[17,18],[18,19],[19,20]
+];
+
+function isValidSigningHand(pts){
+  if(!pts||pts.length<21)return false;
+  const w=pts[0], m=pts[9];
+  const dx=m.x-w.x, dy=m.y-w.y, dz=(m.z||0)-(w.z||0);
+  const palmScale=Math.sqrt(dx*dx+dy*dy+dz*dz);
+  if(palmScale<0.022)return false;
+  if(w.y>0.94&&m.y>0.94)return false;
+  return true;
+}
+
+function drawHandSkeleton(pts, color){
+  if(!pts||pts.length<21)return;
+  const w=lmCanvas.width, h=lmCanvas.height;
+  lmCtx.strokeStyle=color;
+  lmCtx.lineWidth=2.5;
+  for(const [a,b] of HAND_CONNECTIONS){
+    const pa=pts[a], pb=pts[b];
+    lmCtx.beginPath();
+    lmCtx.moveTo(pa.x*w, pa.y*h);
+    lmCtx.lineTo(pb.x*w, pb.y*h);
+    lmCtx.stroke();
+  }
+  lmCtx.fillStyle='#fff';
+  for(const p of pts){
+    lmCtx.beginPath();
+    lmCtx.arc(p.x*w, p.y*h, 3, 0, Math.PI*2);
+    lmCtx.fill();
+  }
+}
+
+function extractLandmarksArray(results, validLeft, validRight){
+  const lm=new Array(1629);
+  let k=0;
+  if(results.faceLandmarks&&results.faceLandmarks.length===468){
+    for(let i=0;i<468;i++){
+      const p=results.faceLandmarks[i];
+      lm[k++]=p.x; lm[k++]=p.y; lm[k++]=p.z||0;
+    }
+  } else {
+    for(let i=0;i<1404;i++) lm[k++]=0.0;
+  }
+  if(results.poseLandmarks&&results.poseLandmarks.length===33){
+    for(let i=0;i<33;i++){
+      const p=results.poseLandmarks[i];
+      lm[k++]=p.x; lm[k++]=p.y; lm[k++]=p.z||0;
+    }
+  } else {
+    for(let i=0;i<99;i++) lm[k++]=0.0;
+  }
+  if(validLeft&&results.leftHandLandmarks&&results.leftHandLandmarks.length===21){
+    for(let i=0;i<21;i++){
+      const p=results.leftHandLandmarks[i];
+      lm[k++]=p.x; lm[k++]=p.y; lm[k++]=p.z||0;
+    }
+  } else {
+    for(let i=0;i<63;i++) lm[k++]=0.0;
+  }
+  if(validRight&&results.rightHandLandmarks&&results.rightHandLandmarks.length===21){
+    for(let i=0;i<21;i++){
+      const p=results.rightHandLandmarks[i];
+      lm[k++]=p.x; lm[k++]=p.y; lm[k++]=p.z||0;
+    }
+  } else {
+    for(let i=0;i<63;i++) lm[k++]=0.0;
+  }
+  return lm;
+}
+
+function initHolisticEngine(){
+  if(typeof Holistic==='undefined'){
+    console.warn('[MP] Holistic global not found, using server /predict_frame');
+    useLocalHolistic=false;
+    return;
+  }
+  try{
+    holisticInstance=new Holistic({
+      locateFile:(file)=>'/holistic/'+file
+    });
+    holisticInstance.setOptions({
+      modelComplexity:1,
+      smoothLandmarks:true,
+      enableSegmentation:false,
+      smoothSegmentation:false,
+      refineFaceLandmarks:false,
+      minDetectionConfidence:0.35,
+      minTrackingConfidence:0.45
+    });
+    holisticInstance.onResults(onHolisticResults);
+    useLocalHolistic=true;
+    holisticReady=true;
+    console.log('[MP] Local MediaPipe Holistic initialized');
+  }catch(e){
+    console.error('[MP] Holistic init error:',e);
+    useLocalHolistic=false;
+  }
+}
+
+function onHolisticResults(results){
+  holisticBusy=false;
+  if(lmCanvas.width!==640||lmCanvas.height!==480){
+    lmCanvas.width=640; lmCanvas.height=480;
+  }
+  lmCtx.clearRect(0,0,lmCanvas.width,lmCanvas.height);
+
+  const validLeft=isValidSigningHand(results.leftHandLandmarks);
+  const validRight=isValidSigningHand(results.rightHandLandmarks);
+  const handVisible=validLeft||validRight;
+
+  if(validLeft) drawHandSkeleton(results.leftHandLandmarks, '#22d3ee');
+  if(validRight) drawHandSkeleton(results.rightHandLandmarks, '#a78bfa');
+
+  const lm=handVisible ? extractLandmarksArray(results, validLeft, validRight) : [];
+
+  if(pendingRequest)return;
+  pendingRequest=true;
+  fetch('/predict_landmarks',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      landmarks:lm,
+      hand_visible:handVisible,
+      demo_mode:demoMode
+    })
+  })
+  .then(r=>{
+    if(r.status===404){
+      // Fallback to /predict_frame if hosted on server without /predict_landmarks
+      useLocalHolistic=false;
+      pendingRequest=false;
+      return null;
+    }
+    return r.json();
+  })
+  .then(d=>{
+    pendingRequest=false;
+    if(d) handlePredictionResponse(d);
+  })
+  .catch(()=>{
+    pendingRequest=false;
+  });
+}
+
+function handlePredictionResponse(d){
+  if(!d||!d.success)return;
+  const badge=document.getElementById('live-pred-badge');
+
+  if(d.hands_detected){
+    lastHandTime=Date.now();
+    sentenceComplete=false;
+    document.getElementById('cam-status').textContent=d.message||'El algılandı';
+    document.getElementById('cam-status').classList.add('detecting');
+    if(badge){
+      badge.textContent=(d.prediction_text&&d.confidence>=0.70)
+        ? (GLOSS_TO_TURKISH[d.prediction_text]||d.prediction_text)+' %'+Math.round(d.confidence*100)
+        : '';
+    }
+  } else {
+    document.getElementById('cam-status').textContent=d.message||'Ellerinizi gösterin...';
+    document.getElementById('cam-status').classList.remove('detecting');
+    if(badge) badge.textContent='';
+  }
+
+  // Confidence + margin + smoothing filter
+  const margin=(typeof d.margin==='number') ? d.margin : 0.30;
+  if(d.hands_detected && d.prediction_text && d.confidence>=CONF_THRESHOLD){
+    if(d.prediction_text===smoothWord){
+      smoothCount++;
+    } else {
+      smoothWord=d.prediction_text;
+      smoothCount=1;
+    }
+    const isFast=(d.confidence>=CONF_FAST_TRACK && margin>=MARGIN_FAST);
+    const needed=isFast ? SMOOTH_FAST : SMOOTH_NEEDED;
+    if(smoothCount>=needed){
+      addWord(d.prediction_text, d.confidence);
+      smoothCount=0;
+      smoothWord='';
+      fetch('/reset_buffer',{method:'POST'}).catch(()=>{});
+    }
+  } else if(!d.hands_detected){
+    smoothWord='';
+    smoothCount=0;
+  }
+
+  // Sentence completion: 2 seconds without hands
+  if(sentenceWords.length>0 && !sentenceComplete && !d.hands_detected && Date.now()-lastHandTime>2000){
+    completeSentence();
+    setTimeout(()=>{
+      if(sentenceComplete) archiveSentence();
+    }, 1500);
+  }
+
+  if(sentenceComplete && d.hands_detected && d.prediction_text && d.confidence>=CONF_THRESHOLD){
+    archiveSentence();
+  }
+}
 
 let currentFacingMode = 'user';
 async function flipCamera(){
   currentFacingMode = (currentFacingMode === 'user') ? 'environment' : 'user';
+  video.style.transform = (currentFacingMode === 'user') ? 'scaleX(-1)' : 'none';
   if(camStream){ camStream.getTracks().forEach(t=>t.stop()); camStream=null; }
   camRunning = false;
   await startCamera();
 }
+
 async function startCamera(){
   console.log('[CAM] startCamera called');
   try{
+    if(!holisticInstance) initHolisticEngine();
     if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
       const gum = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
       if(!gum){
-        console.error('[CAM] No camera API available');
-        document.getElementById('cam-status').textContent='Bu tarayici kamerayi desteklemiyor. HTTPS veya localhost gerekli.';
+        document.getElementById('cam-status').textContent='Kamera desteklenmiyor.';
         return;
       }
-      console.log('[CAM] Using legacy getUserMedia');
       camStream = await new Promise((ok,fail)=>gum.call(navigator,{video:{facingMode:currentFacingMode,width:{ideal:640},height:{ideal:480}},audio:false},ok,fail));
     } else {
-      console.log('[CAM] Using modern getUserMedia');
       camStream=await navigator.mediaDevices.getUserMedia({
         video:{facingMode:currentFacingMode,width:{ideal:640},height:{ideal:480}},
         audio:false
       });
     }
-    console.log('[CAM] Got stream, setting video source');
     video.srcObject=camStream;
     await video.play();
     canvas.width=640;canvas.height=480;
     camRunning=true;
-    console.log('[CAM] Camera running, starting captureLoop');
-    document.getElementById('cam-status').textContent='Hazir - isaret yapin';
-    document.getElementById('cam-status').classList.add('detecting');
+    document.getElementById('cam-status').textContent='Hazır - ellerinizi gösterin';
     captureLoop();
   }catch(e){
-    document.getElementById('cam-status').textContent='Kamera erisimi reddedildi: '+e.message;
+    document.getElementById('cam-status').textContent='Kamera erişimi bekleniyor...';
     console.error('[CAM] Camera error:',e);
   }
 }
 
-const SEND_INTERVAL=80; // ms between frame sends (~12fps)
+const SEND_INTERVAL=75; // ~13 FPS
 let lastSendTime=0;
 let pendingRequest=false;
+
+function drawNormalized4x3Frame(){
+  const vw=video.videoWidth||640;
+  const vh=video.videoHeight||480;
+  ctx.fillStyle='#000';
+  ctx.fillRect(0,0,640,480);
+  ctx.save();
+  // Mirror horizontally to match training data (collect.py cv2.flip(frame, 1))
+  ctx.translate(640,0);
+  ctx.scale(-1,1);
+  if(vw<vh){
+    // Portrait video: pad left/right to 4:3 so aspect ratio is never distorted
+    const targetW=vh*(4/3);
+    const drawW=(vw/targetW)*640;
+    const padX=(640-drawW)/2;
+    ctx.drawImage(video, padX, 0, drawW, 480);
+  } else {
+    ctx.drawImage(video, 0, 0, 640, 480);
+  }
+  ctx.restore();
+}
 
 function captureLoop(){
   if(!camRunning)return;
   requestAnimationFrame(captureLoop);
 
   const now=Date.now();
-  // FPS counter
   frameCount++;
   if(now-fpsTime>=1000){
     fps=frameCount;
@@ -292,16 +543,24 @@ function captureLoop(){
     document.getElementById('cam-fps').textContent=fps+'fps';
   }
 
-  // Throttle frame sending
-  if(now-lastSendTime<SEND_INTERVAL||pendingRequest)return;
+  if(now-lastSendTime<SEND_INTERVAL)return;
+  if(video.readyState<2)return;
   lastSendTime=now;
 
-  // Flip horizontally for front camera (mirror fix)
-  ctx.save();
-  ctx.scale(-1,1);
-  ctx.drawImage(video,-canvas.width,0,canvas.width,canvas.height);
-  ctx.restore();
-  const jpeg=canvas.toDataURL('image/jpeg',0.92);
+  drawNormalized4x3Frame();
+
+  if(useLocalHolistic && holisticReady && holisticInstance){
+    if(holisticBusy)return;
+    holisticBusy=true;
+    holisticInstance.send({image:canvas}).catch(e=>{
+      holisticBusy=false;
+      console.warn('[MP] send error:',e);
+    });
+    return;
+  }
+
+  if(pendingRequest)return;
+  const jpeg=canvas.toDataURL('image/jpeg',0.85);
   const b64=jpeg.split(',')[1];
 
   pendingRequest=true;
@@ -310,92 +569,43 @@ function captureLoop(){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({image_base64:b64})
   })
-  .then(r=>{console.log('[CAM] Response status:',r.status);return r.json()})
+  .then(r=>r.json())
   .then(d=>{
     pendingRequest=false;
-    console.log('[CAM] Prediction:',d.prediction_text,d.confidence,d.message||'');
-    if(!d.success){console.log('[CAM] Not success:',d.error);return;}
-
-    // Hand detection status
-    if(d.hands_detected){
-      lastHandTime=Date.now();
-      sentenceComplete=false;
-      document.getElementById('cam-status').textContent='El algilandi';
-      document.getElementById('cam-status').classList.add('detecting');
-    } else {
-      document.getElementById('cam-status').textContent=d.message||'Bekleniyor...';
-      document.getElementById('cam-status').classList.remove('detecting');
-    }
-
-    // New prediction with confidence filter + smoothing (ONLY when hands detected)
-    if(d.hands_detected && d.prediction_text && d.confidence>CONF_THRESHOLD){
-      if(d.prediction_text === smoothWord){
-        smoothCount++;
-      } else {
-        smoothWord = d.prediction_text;
-        smoothCount = 1;
-      }
-      // V2 fast-track: %94+ guvende 2 frame yeter, normalde 4 frame
-      const needed = (d.confidence >= CONF_FAST_TRACK) ? SMOOTH_FAST : SMOOTH_NEEDED;
-      if(smoothCount >= needed){
-        addWord(d.prediction_text,d.confidence);
-        smoothCount = 0;
-      }
-    } else if(!d.hands_detected){
-      // Reset smoothing when hands disappear
-      smoothWord='';
-      smoothCount=0;
-    }
-
-    // Sentence completion: 2 seconds without hands
-    if(sentenceWords.length>0 && !sentenceComplete && !d.hands_detected && Date.now()-lastHandTime>2000){
-      completeSentence();
-      // Auto archive after 1.5 seconds
-      setTimeout(()=>{
-        if(sentenceComplete) archiveSentence();
-      }, 1500);
-    }
-
-    // If sentence is complete and new word comes, archive first then add
-    if(sentenceComplete && d.hands_detected && d.prediction_text && d.confidence>CONF_THRESHOLD){
-      archiveSentence();
-    }
-
-    // Show buffer/message info
-    if(d.message){
-      document.getElementById('cam-status').textContent=d.message;
-    }
+    handlePredictionResponse(d);
   })
-  .catch(e=>{
+  .catch(()=>{
     pendingRequest=false;
   });
 }
 
 function addWord(word,conf){
-  // If sentence was completed, archive it and start fresh
   if(sentenceComplete){
     archiveSentence();
   }
-  // Minimum time gap between different words (prevents transition noise)
   const now=Date.now();
   if(word!==lastAddedWord && now-lastWordTime<MIN_WORD_GAP) return;
-  // Track same word predictions
   if(word===lastAddedWord){
     sameWordCount++;
     if(sameWordCount>SAME_WORD_MAX) return;
   } else {
     sameWordCount=0;
   }
+
+  // Context disambiguation for KAHVE / KAFE
+  if(word==='KAHVE'||word==='KAFE'){
+    const last=sentenceWords.length>0 ? sentenceWords[sentenceWords.length-1] : null;
+    if(last==='BERABER') word='KAHVE';
+    else if(last==='YAN'||last==='PARK') word='KAFE';
+  }
+
   lastAddedWord=word;
   lastWordTime=now;
-  // Don't add same word twice in a row to sentence
   if(sentenceWords.length>0&&sentenceWords[sentenceWords.length-1]===word)return;
-  // Don't add same word more than twice in entire sentence
   const wordCount = sentenceWords.filter(w=>w===word).length;
   if(wordCount >= 2) return;
   sentenceWords.push(word);
   renderWords();
-  // Show live Turkish translation as words are added
   document.getElementById('sentence-turkish').textContent = glossToSentence(sentenceWords).replace(/\.$/, '...');
   document.getElementById('btn-speak').disabled=false;
 }
@@ -406,50 +616,172 @@ function renderWords(){
   sentenceWords.forEach((w,i)=>{
     const chip=document.createElement('span');
     chip.className='word-chip'+(i===sentenceWords.length-1?' latest':'');
-    chip.textContent=glossToTR[w]||w;
+    const tr=GLOSS_TO_TURKISH[w]||w.toLowerCase();
+    chip.textContent=tr.charAt(0).toUpperCase()+tr.slice(1);
     container.appendChild(chip);
   });
 }
 
-// Gloss -> Turkish display
-const glossToTR={
-  'ABI':'Abi','ABLA':'Abla','AFERIN':'Aferin','AGUSTOS':'Ağustos',
-  'AKILLI':'Akıllı','AKRABA':'Akraba','AKSAM':'Akşam','ALERJI':'Alerji',
-  'ALLAH':'Allah','ALTI':'Altı','AMCA':'Amca','AMIN':'Amin','ANNE':'Anne',
-  'APTAL':'Aptal','ARALIK':'Aralık','ARAP':'Arap','ARKADAS':'Arkadaş',
-  'ASK':'Aşk','ATATURK':'Atatürk','AYIP':'Ayıp','AYRAN':'Ayran',
-  'BABA':'Baba','BAKLAVA':'Baklava','BARIS':'Barış','BEN':'Ben',
-  'BES':'Beş','BILGISAYAR':'Bilgisayar','BIR':'Bir','BOS VERMEK':'Boş vermek',
-  'BU KADAR':'Bu kadar','BUGUN':'Bugün','BUYUK':'Büyük',
-  'CARSAMBA':'Çarşamba','CAY':'Çay','CD':'CD','CEP TELEFONU':'Cep telefonu',
-  'CEZA':'Ceza','CIKOLATA':'Çikolata','CUMA':'Cuma','CUMARTESI':'Cumartesi',
-  'CUNKU':'Çünkü','DIKKAT':'Dikkat','DOKTOR':'Doktor','DOKUZ':'Dokuz',
-  'DORT':'Dört','DOYMAK':'Doymak','DUN':'Dün','EKIM':'Ekim','EKMEK':'Ekmek',
-  'ELHAMDULILLAH':'Elhamdülillah','ERIK':'Erik','EV':'Ev','EVET':'Evet',
-  'EVLENMEK':'Evlenmek','EYLUL':'Eylül','FINAL':'Final','FUTBOL':'Futbol',
-  'GUN':'Gün','HANGI':'Hangi','HAZIRAN':'Haziran','HEMSIRE':'Hemşire',
-  'HENTBOL':'Hentbol','HOSCA KAL':'Hoşça kal','IKI':'İki','IYI':'İyi',
-  'KAHVE':'Kahve','KASIM':'Kasım','KIS':'Kış','KOTU':'Kötü','KUCUK':'Küçük',
-  'MART':'Mart','MAYIS':'Mayıs','MERHABA':'Merhaba','NISAN':'Nisan',
-  'OCAK':'Ocak','OGRETMEN':'Öğretmen','OKUL':'Okul','ORUC':'Oruç',
-  'PAZAR':'Pazar','PAZARTESI':'Pazartesi','PERSEMBE':'Perşembe',
-  'SABAH':'Sabah','SALI':'Salı','SEKIZ':'Sekiz','SEN':'Sen','SIFIR':'Sıfır',
-  'SORU':'?','SU':'Su','SUBAT':'Şubat','TEMMUZ':'Temmuz','TESEKKUR':'Teşekkür',
-  'TUVALET':'Tuvalet','TV':'TV','UC':'Üç','VOLEYBOL':'Voleybol',
-  'YARDIM':'Yardım','YATMAK':'Yatmak','YEDI':'Yedi','YEMEK':'Yemek',
-  'YETER':'Yeter','ZENGIN':'Zengin'
+// ═══════════════════════════════════════════════
+// NLP: 122 Kelime Gloss → Doğal Türkçe Cümle
+// ═══════════════════════════════════════════════
+const GLOSS_TO_TURKISH = {
+  'MERHABA':'merhaba', 'TESEKKUR':'teşekkür ederim', 'EVET':'evet', 'HAYIR':'hayır',
+  'IYI':'iyi', 'KOTU':'kötü', 'BUYUK':'büyük', 'KUCUK':'küçük',
+  'BEN':'ben', 'SEN':'sen', 'BABA':'baba', 'ANNE':'anne', 'ABLA':'abla',
+  'ABI':'abi', 'ABİ':'abi', 'AMCA':'amca', 'ARKADAS':'arkadaş', 'OGRETMEN':'öğretmen',
+  'DOKTOR':'doktor', 'HEMSIRE':'hemşire', 'AKRABA':'akraba',
+  'OKUL':'okul', 'EV':'ev', 'TUVALET':'tuvalet', 'SU':'su',
+  'CAY':'çay', 'KAHVE':'kahve', 'EKMEK':'ekmek', 'YEMEK':'yemek',
+  'CIKOLATA':'çikolata', 'BAKLAVA':'baklava', 'AYRAN':'ayran', 'ERIK':'erik',
+  'SABAH':'sabah', 'AKSAM':'akşam', 'BUGUN':'bugün', 'DUN':'dün', 'GUN':'gün',
+  'KIS':'kış',
+  'BIR':'bir', 'IKI':'iki', 'UC':'üç', 'DORT':'dört', 'BES':'beş',
+  'ALTI':'altı', 'YEDI':'yedi', 'SEKIZ':'sekiz', 'DOKUZ':'dokuz', 'SIFIR':'sıfır',
+  'OCAK':'ocak', 'SUBAT':'şubat', 'MART':'mart', 'NISAN':'nisan',
+  'MAYIS':'mayıs', 'HAZIRAN':'haziran', 'TEMMUZ':'temmuz', 'AGUSTOS':'ağustos',
+  'EYLUL':'eylül', 'EKIM':'ekim', 'KASIM':'kasım', 'ARALIK':'aralık',
+  'PAZARTESI':'pazartesi', 'SALI':'salı', 'CARSAMBA':'çarşamba',
+  'PERSEMBE':'perşembe', 'CUMA':'cuma', 'CUMARTESI':'cumartesi', 'PAZAR':'pazar',
+  'ASK':'aşk', 'YARDIM':'yardım', 'DIKKAT':'dikkat', 'CEZA':'ceza',
+  'FUTBOL':'futbol', 'VOLEYBOL':'voleybol', 'HENTBOL':'hentbol',
+  'TV':'TV', 'CD':'CD', 'BILGISAYAR':'bilgisayar',
+  'AKILLI':'akıllı', 'APTAL':'aptal', 'ZENGIN':'zengin',
+  'ALERJI':'alerji', 'AYIP':'ayıp', 'ORUC':'oruç', 'FINAL':'final',
+  'ALLAH':'Allah', 'AMIN':'amin', 'ELHAMDULILLAH':'elhamdülillah',
+  'ATATURK':'Atatürk', 'ARAP':'Arap', 'BARIS':'barış', 'BARIŞ':'barış',
+  'AFERIN':'aferin', 'AFERİN':'aferin',
+  'EVLENMEK':'evlenmek', 'YATMAK':'yatmak', 'DOYMAK':'doymak',
+  'HANGI':'hangi', 'CUNKU':'çünkü', 'YETER':'yeter',
+  'HOSCA KAL':'hoşça kal', 'BOS VERMEK':'boş vermek', 'BU KADAR':'bu kadar',
+  'CEP TELEFONU':'cep telefonu', 'LUTFEN':'lütfen',
+  'NASILSIN':'nasılsın', 'NE':'ne', 'KAC':'kaç', 'NEREDE':'nerede',
+  'YAPMAK':'yapmak', 'CALISMAK':'çalışmak', 'YORULMAK':'yorulmak',
+  'BITMEK':'bitmek', 'ICMEK':'içmek', 'BULUSMAK':'buluşmak',
+  'GORUSMEK':'görüşmek', 'BAKMAK':'bakmak',
+  'COK':'çok', 'SAAT':'saat', 'SONRA':'sonra', 'BOS':'boş',
+  'BERABER':'beraber', 'TAMAM':'tamam',
+  'PARK':'park', 'YAN':'yan', 'KAFE':'kafe', 'KENDI':'kendi'
 };
 
-function glossToSentence(words){
-  const parts = words.map(w => glossToTR[w] || w.charAt(0)+w.slice(1).toLowerCase());
-  let sentence = parts.join(' ');
-  // Clean up: "kelime ?" -> "kelime?"
-  sentence = sentence.replace(/\s+\?/g, '?');
-  // Capitalize first letter
-  sentence = sentence.charAt(0).toUpperCase() + sentence.slice(1);
-  // Add period if no punctuation at end
-  if(!/[.!?]$/.test(sentence)) sentence += '.';
-  return sentence;
+const VERB_CONJ = {
+  'YAPMAK':   { ben:'yapıyorum',   sen:'yapıyorsun',   _:'yapıyor' },
+  'CALISMAK': { ben:'çalışıyorum', sen:'çalışıyorsun', _:'çalışıyor' },
+  'YORULMAK': { ben:'yoruldum',    sen:'yoruldun',     _:'yoruldu' },
+  'BITMEK':   { ben:'bitiyor',     sen:'bitiyor',      _:'bitiyor' },
+  'ICMEK':    { ben:'içiyorum',    sen:'içiyorsun',    _:'içelim' },
+  'BULUSMAK': { ben:'buluşalım',   sen:'buluşalım',    _:'buluşalım' },
+  'GORUSMEK': { ben:'görüşürüz',   sen:'görüşürüz',    _:'görüşürüz' },
+  'BAKMAK':   { ben:'bakıyorum',   sen:'bak',          _:'bak' },
+  'EVLENMEK': { ben:'evleniyorum', sen:'evleniyorsun', _:'evleniyor' },
+  'YATMAK':   { ben:'yatıyorum',   sen:'yatıyorsun',   _:'yatıyor' },
+  'DOYMAK':   { ben:'doydum',      sen:'doydun',       _:'doydu' },
+  'BOS VERMEK':{ ben:'boş veriyorum', sen:'boş ver',   _:'boş ver' }
+};
+const PHRASE_OVERRIDE = {
+  'TESEKKUR': 'teşekkür ederim',
+  'NASILSIN': 'nasılsın',
+  'HOSCA KAL': 'hoşça kal',
+  'BU KADAR': 'bu kadar',
+  'CEP TELEFONU': 'cep telefonu',
+  'AFERIN': 'aferin', 'AFERİN': 'aferin',
+  'ELHAMDULILLAH': 'elhamdülillah',
+  'AMIN': 'amin',
+  'EVET': 'evet',
+  'YETER': 'yeter',
+  'DIKKAT': 'dikkat',
+  'YARDIM': 'yardım',
+  'KENDI': 'kendine'
+};
+const QUESTION_GLOSS = ['NE','KAC','NEREDE','HANGI','NASILSIN','SORU'];
+
+function glossToSentence(glossWords){
+  if(!glossWords||glossWords.length===0)return '';
+  const out=[];
+  let lastSubject=null;
+  let lastWasVerb=false;
+  const hasBen=glossWords.includes('BEN');
+  const hasSen=glossWords.includes('SEN');
+  const hasBeraber=glossWords.includes('BERABER');
+  const hasKendi=glossWords.includes('KENDI');
+  glossWords=glossWords.filter((w,i)=>i===0||w!==glossWords[i-1]);
+  const COMMA_AFTER=new Set(['TAMAM','EVET','HOSCA KAL','AFERIN','MERHABA']);
+  const NUM_ABL={'BIR':'birden','IKI':'ikiden','UC':'üçten','DORT':'dörtten',
+                 'BES':'beşten','ALTI':'altıdan','YEDI':'yediden','SEKIZ':'sekizden',
+                 'DOKUZ':'dokuzdan','ON':'ondan'};
+  function locSuf(w){
+    const last=w.slice(-1);
+    const vowels=w.match(/[aeıioöuü]/gi)||[];
+    const lv=vowels.length?vowels[vowels.length-1].toLowerCase():'a';
+    const voiceless='çfhkpsşt'.includes(last);
+    const front='eiöü'.includes(lv);
+    return (voiceless?'t':'d')+(front?'e':'a');
+  }
+  for(let i=0;i<glossWords.length;i++){
+    const w=glossWords[i];
+    const prev=i>0?glossWords[i-1]:null;
+    const next=i<glossWords.length-1?glossWords[i+1]:null;
+    const next2=i<glossWords.length-2?glossWords[i+2]:null;
+    if(NUM_ABL[w]&&next==='SONRA'){
+      out.push(NUM_ABL[w]); out.push('sonra'); i++; lastWasVerb=false; continue;
+    }
+    if(w==='PARK'&&next==='YAN'&&next2&&GLOSS_TO_TURKISH[next2]){
+      const nounTr=GLOSS_TO_TURKISH[next2];
+      out.push('parkın'); out.push('yanındaki'); out.push(nounTr+locSuf(nounTr));
+      i+=2; lastWasVerb=false; continue;
+    }
+    if(w==='YAN'){ out.push('yanı'); lastWasVerb=false; continue; }
+    if(w==='BOS'){
+      const s=lastSubject||(hasSen&&!hasBen?'sen':'ben');
+      out.push(s==='sen'?'boşsun':'boşum'); lastWasVerb=false; continue;
+    }
+    if(w==='KAC'&&prev==='SAAT'){ out.push('kaçta'); lastWasVerb=false; continue; }
+    if(['BES','ALTI','YEDI','SEKIZ','DOKUZ','UC','DORT','IKI','BIR','ON'].includes(w)&&prev==='SAAT'){
+      const numMap={'BIR':'birde','IKI':'ikide','UC':'üçte','DORT':'dörtte','BES':'beşte',
+                    'ALTI':'altıda','YEDI':'yedide','SEKIZ':'sekizde','DOKUZ':'dokuzda','ON':'onda'};
+      out.push(numMap[w]||(GLOSS_TO_TURKISH[w]+'te')); lastWasVerb=false; continue;
+    }
+    if(w==='BEN'){ lastSubject='ben'; out.push('ben'); lastWasVerb=false; continue; }
+    if(w==='SEN'){ lastSubject='sen'; out.push('sen'); lastWasVerb=false; continue; }
+    if(w==='IYI'){
+      if(hasKendi) out.push('iyi');
+      else if(lastSubject==='ben'||(i===0&&hasBen)||(i===0&&!hasSen)) out.push('iyiyim');
+      else if(lastSubject==='sen'||(i===0&&hasSen)) out.push('iyisin');
+      else out.push('iyi');
+      lastWasVerb=false; continue;
+    }
+    if(COMMA_AFTER.has(w)){
+      const tr=(GLOSS_TO_TURKISH[w]||w).toLowerCase();
+      const tail=(i<glossWords.length-1)?',':'';
+      out.push(tr+tail); lastWasVerb=false; continue;
+    }
+    if(VERB_CONJ[w]){
+      let subj;
+      if(hasKendi&&!hasBen&&!hasSen) subj='sen';
+      else if(hasBeraber&&!hasBen&&!hasSen) subj='_';
+      else subj=lastSubject||(hasSen&&!hasBen?'sen':'ben');
+      if(lastWasVerb&&out.length>0) out[out.length-1]+=',';
+      out.push(VERB_CONJ[w][subj]||VERB_CONJ[w]['_']);
+      lastWasVerb=true; continue;
+    }
+    if(PHRASE_OVERRIDE[w]){ out.push(PHRASE_OVERRIDE[w]); lastWasVerb=false; continue; }
+    out.push((GLOSS_TO_TURKISH[w]||w).toLowerCase());
+    lastWasVerb=false;
+  }
+  let s=out.join(' ');
+  s=s.replace(/\s+([?!.,])/g,'$1');
+  s=s.replace(/,\s*$/,'');
+  s=s.charAt(0).toUpperCase()+s.slice(1);
+  const hasQ=glossWords.some(w=>QUESTION_GLOSS.includes(w));
+  if(hasQ||(hasBeraber&&!hasBen&&!hasSen)){
+    if(hasBeraber&&!hasQ&&!s.endsWith(' mi')&&!s.endsWith(' mı')&&!s.endsWith(' mu')&&!s.endsWith(' mü')){
+      s=s.replace(/[.!?]?$/,'')+' mi';
+    }
+    if(!/[?!]$/.test(s)) s+='?';
+  } else {
+    if(!/[.!?]$/.test(s)) s+='.';
+  }
+  return s;
 }
 
 function completeSentence(){
@@ -659,8 +991,9 @@ function initAvatar(){
 
       // Load poses
       fetch('/api/list-poses').then(r=>r.json()).then(d=>{
-        if(d.poses){
-          savedPoses=d.poses;
+        const p = d.poses || d;
+        if(p && Object.keys(p).length > 0){
+          savedPoses=p;
           avSetStatus(Object.keys(savedPoses).length+' poz yuklendi',2500);
         }
       }).catch(()=>avSetStatus('Pozlar yuklenemedi',3000));

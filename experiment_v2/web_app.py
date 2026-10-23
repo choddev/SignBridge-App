@@ -9,8 +9,6 @@ Tarayici: http://localhost:5050
 import cv2
 import mediapipe as mp
 import numpy as np
-import torch
-import torch.nn as nn
 import base64
 import time
 import json
@@ -19,18 +17,31 @@ from pathlib import Path
 from collections import deque
 from flask import Flask, render_template_string, Response, request, jsonify
 from flask_socketio import SocketIO, emit
+import onnxruntime as ort
 
-BASE    = Path(__file__).parent
-CKPT    = BASE / "checkpoints" / "best_model.pt"
-SEQ_LEN = 30
+BASE           = Path(__file__).parent
+CKPT           = BASE / "checkpoints" / "best_model.pt"
+ONNX_PATH      = BASE / "checkpoints" / "model_v2.onnx"
+LABEL_MAP_PATH = BASE / "checkpoints" / "label_map.json"
+SEQ_LEN        = 30
+PROB_AVG_WINDOW = 3
+INTER_SIGN_PAUSE_SEC = 0.50
 
 # ---- Boyutlar (V2 modeli icin) ----
-FACE_END  = 468 * 3          # 1404
-POSE_END  = FACE_END + 33*3  # 1503
-LEFT_END  = POSE_END + 21*3  # 1566
-RIGHT_END = LEFT_END + 21*3  # 1629
-HAND_VEL  = 21*3 + 21*3      # 126
+FACE_END   = 468 * 3          # 1404
+POSE_END   = FACE_END + 33*3  # 1503
+LEFT_END   = POSE_END + 21*3  # 1566
+RIGHT_END  = LEFT_END + 21*3  # 1629
+HAND_VEL   = 21*3 + 21*3      # 126
 INPUT_SIZE = RIGHT_END + HAND_VEL  # 1755
+
+def _normalize_gloss_key(k: str) -> str:
+    return (k.replace("İ", "I").replace("ı", "I")
+             .replace("Ş", "S").replace("ş", "S")
+             .replace("Ç", "C").replace("ç", "C")
+             .replace("Ğ", "G").replace("ğ", "G")
+             .replace("Ü", "U").replace("ü", "U")
+             .replace("Ö", "O").replace("ö", "O").upper())
 
 # ---- 2 Katmanli Normalizasyon (eğitim ile aynı) ----
 def normalize_landmarks(lm):
@@ -72,36 +83,42 @@ def add_velocity(seq):
     return np.concatenate([seq, vel], axis=1).astype(np.float32)
 
 # ---- Model ----
-class GRUModel(nn.Module):
-    def __init__(self, input_size=INPUT_SIZE, hidden=256, layers=2, classes=3, dropout=0.3):
-        super().__init__()
-        self.gru = nn.GRU(input_size, hidden, layers, batch_first=True,
-                           dropout=dropout if layers > 1 else 0.0)
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(128, classes)
-        )
-    def forward(self, x):
-        _, h = self.gru(x)
-        return self.classifier(h[-1])
-
-ckpt         = torch.load(CKPT, map_location="cpu")
-label_map    = ckpt["label_map"]
-num_classes  = ckpt["num_classes"]
+with open(LABEL_MAP_PATH, "r", encoding="utf-8") as _f:
+    _raw_label_map = json.load(_f)
+label_map    = {_normalize_gloss_key(k): int(v) for k, v in _raw_label_map.items()}
+num_classes  = len(label_map)
 idx_to_label = {v: k for k, v in label_map.items()}
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model  = GRUModel(classes=num_classes).to(device)
-model.load_state_dict(ckpt["model_state_dict"])
-model.eval()
+ort_session = ort.InferenceSession(str(ONNX_PATH), providers=["CPUExecutionProvider"])
+device = "onnx-cpu"
 print(f"Model yuklendi | {num_classes} kelime | {device}")
+
+def run_model_probs(seq_30x1755: np.ndarray) -> np.ndarray:
+    inp = np.ascontiguousarray(seq_30x1755[None, :, :], dtype=np.float32)
+    logits = ort_session.run(None, {"input": inp})[0][0].astype(np.float64)
+    logits -= np.max(logits)
+    exp_l = np.exp(logits)
+    return (exp_l / np.sum(exp_l)).astype(np.float32)
 
 # ---- MediaPipe ----
 mp_holistic = mp.solutions.holistic
 mp_drawing  = mp.solutions.drawing_utils
+
+def _is_valid_signing_hand(hand_lms) -> bool:
+    if hand_lms is None:
+        return False
+    pts = hand_lms.landmark
+    w, m = pts[0], pts[9]
+    dx, dy, dz = (m.x - w.x), (m.y - w.y), (m.z - w.z)
+    palm_scale = (dx*dx + dy*dy + dz*dz) ** 0.5
+    if palm_scale < 0.022:
+        return False
+    if w.y > 0.94 and m.y > 0.94:
+        return False
+    return True
+
+def detect_active_hands(results) -> bool:
+    return _is_valid_signing_hand(results.left_hand_landmarks) or _is_valid_signing_hand(results.right_hand_landmarks)
 
 def extract_landmarks(results):
     lm = []
@@ -113,11 +130,11 @@ def extract_landmarks(results):
         for p in results.pose_landmarks.landmark: lm.extend([p.x, p.y, p.z])
     else:
         lm.extend([0.0] * 33 * 3)
-    if results.left_hand_landmarks:
+    if _is_valid_signing_hand(results.left_hand_landmarks):
         for p in results.left_hand_landmarks.landmark: lm.extend([p.x, p.y, p.z])
     else:
         lm.extend([0.0] * 21 * 3)
-    if results.right_hand_landmarks:
+    if _is_valid_signing_hand(results.right_hand_landmarks):
         for p in results.right_hand_landmarks.landmark: lm.extend([p.x, p.y, p.z])
     else:
         lm.extend([0.0] * 21 * 3)
@@ -125,23 +142,25 @@ def extract_landmarks(results):
 
 # ---- Uygulama durumu ----
 state = {
-    "buffer":        deque(maxlen=SEQ_LEN),
-    "smooth_counts": {k: 0 for k in label_map},
-    "sentence":      [],
-    "current_word":  "",
-    "current_conf":  0.0,
-    "last_add_time": 0.0,
-    "last_hand_time": 0.0,
-    "running":       False,
-    "cap":           None,
-    "holistic":      None,
-    "demo_mode":     False,   # Demo modu: sadece 10 cumlede gecen kelimeleri tahmin et
+    "buffer":           deque(maxlen=SEQ_LEN),
+    "prob_history":     deque(maxlen=PROB_AVG_WINDOW),
+    "smooth_counts":    {k: 0 for k in label_map},
+    "sentence":         [],
+    "current_word":     "",
+    "current_conf":     0.0,
+    "last_add_time":    0.0,
+    "last_hand_time":   0.0,
+    "pause_reset_done": False,
+    "running":          False,
+    "cap":              None,
+    "holistic":         None,
+    "demo_mode":        False,   # Demo modu: sadece 10 cumlede gecen kelimeleri tahmin et
 }
 
-# 10 demo cumlesinin kelimeleri (122 sinif yerine sadece bunlar arasinda secim)
+# 10 demo cumlesinin 29 kelimesi (122 sinif yerine sadece bunlar arasinda secim)
 DEMO_WORDS = {
     "MERHABA","NASILSIN","IYI","SEN","NE","YAPMAK",
-    "BEN","CALISMAK","YORULMAK",
+    "BEN","CALISMAK","COK","YORULMAK",
     "SAAT","KAC","BITMEK",
     "AKSAM","BES","SONRA","BOS",
     "BERABER","KAHVE","ICMEK",
@@ -149,31 +168,14 @@ DEMO_WORDS = {
     "PARK","YAN","KAFE",
     "GORUSMEK","KENDI","BAKMAK",
 }
-# Demo modu icin maske (logit'lere uygulanir): allow=0, block=-inf
-import numpy as _np_dm
-_DEMO_MASK_NP = None
-_DEMO_MASK_TENSORS = {}  # device -> torch.Tensor cache (her cihaz icin tek tensor)
-def _get_demo_mask_tensor(device):
-    global _DEMO_MASK_NP
-    if _DEMO_MASK_NP is None:
-        m = _np_dm.full(len(label_map), -1e9, dtype=_np_dm.float32)
-        for w, i in label_map.items():
-            if w in DEMO_WORDS:
-                m[i] = 0.0
-        _DEMO_MASK_NP = m
-    key = str(device)
-    t = _DEMO_MASK_TENSORS.get(key)
-    if t is None:
-        t = torch.tensor(_DEMO_MASK_NP, device=device)
-        _DEMO_MASK_TENSORS[key] = t
-    return t
 
 CONF_THRESHOLD  = 0.88
 CONF_FAST_TRACK = 0.95
-SMOOTH_NEEDED   = 2
-SMOOTH_FAST     = 1
+MARGIN_MIN      = 0.20
 MARGIN_FAST     = 0.50
-COOLDOWN_SEC    = 0.4    # daha kisa - hizli ardisik
+SMOOTH_NEEDED   = 3
+SMOOTH_FAST     = 2
+COOLDOWN_SEC    = 0.80   # Gecis gurultusunu onlemek icin stabil bekleme suresi
 HAND_GONE_SEC   = 2.0    # el cekilince cumle bitis suresi
 
 # ---- Flask ----
@@ -680,6 +682,22 @@ function manualAdd() {
   }
 }
 
+window.addPhrase = function(words) {
+  if (!Array.isArray(words) || words.length === 0) return;
+  socket.emit("clear_sentence");
+  sentence = [];
+  words.forEach(w => {
+    socket.emit("add_word_manual", { word: w });
+  });
+};
+
+socket.on("sentence_update", (data) => {
+  if (data && Array.isArray(data.sentence)) {
+    sentence = data.sentence;
+    updateSentenceBox();
+  }
+});
+
 // Model bilgisi al
 socket.emit("get_info");
 socket.on("info", (data) => {
@@ -691,6 +709,9 @@ socket.on("info", (data) => {
     const chip = document.createElement("div");
     chip.className = "word-chip";
     chip.id = "chip_" + w;
+    chip.style.cursor = "pointer";
+    chip.title = "Cümleye eklemek için tıkla";
+    chip.onclick = () => socket.emit("add_word_manual", { word: w });
     // Turkce karakterli goster (GLOSS_TO_TURKISH'ten al)
     const display = GLOSS_TO_TURKISH[w] || w.toLowerCase();
     chip.textContent = display.charAt(0).toUpperCase() + display.slice(1);
@@ -1263,65 +1284,76 @@ def handle_start():
                 mp_draw.draw_landmarks(frame, results.pose_landmarks,
                                         mp.solutions.pose.POSE_CONNECTIONS)
 
-                lm = extract_landmarks(results)
-                lm_norm = normalize_landmarks(lm)      # V2: 2-katman normalize
-                state["buffer"].append(lm_norm)
-
-                hand_visible = (results.left_hand_landmarks is not None or
-                                results.right_hand_landmarks is not None)
-
+                hand_visible = detect_active_hands(results)
                 now_t = time.time()
                 sentence_done = False
 
                 if hand_visible:
                     state["last_hand_time"] = now_t
+                    state["pause_reset_done"] = False
+                    lm = extract_landmarks(results)
+                    lm_norm = normalize_landmarks(lm)      # V2: 2-katman normalize
+                    state["buffer"].append(lm_norm)
                 else:
+                    # Inter-sign pause: eller 500ms+ kaybolunca buffer ve olasilik gecmisini sifirla
+                    if (not state.get("pause_reset_done") and state["last_hand_time"] > 0 and
+                        (now_t - state["last_hand_time"]) >= INTER_SIGN_PAUSE_SEC):
+                        state["buffer"].clear()
+                        state["prob_history"].clear()
+                        state["smooth_counts"] = {k: 0 for k in label_map}
+                        state["current_word"] = ""
+                        state["current_conf"] = 0.0
+                        state["pause_reset_done"] = True
+
                     # El cekileli HAND_GONE_SEC gecti ve cumle varsa → cumle bitti
                     if (state["sentence"] and state["last_hand_time"] > 0 and
                         (now_t - state["last_hand_time"]) >= HAND_GONE_SEC):
                         sentence_done = True
                         state["last_hand_time"] = 0.0  # tekrar tetikleme
 
-                pred_word = state["current_word"]
+                pred_word = ""
                 pred_conf = 0.0
                 added     = False
 
-                if len(state["buffer"]) == SEQ_LEN:
+                if hand_visible and len(state["buffer"]) == SEQ_LEN:
                     seq = np.array(state["buffer"], dtype=np.float32)   # (30, 1629) normalize
                     seq = add_velocity(seq)                              # (30, 1755)
                     seq = np.clip(seq, -5, 5)
-                    inp = torch.tensor(seq).unsqueeze(0).to(device)
 
-                    with torch.no_grad():
-                        out  = model(inp)
-                        prob = torch.softmax(out, dim=1)[0]
-                        top_vals, top_idx = prob.topk(15)
-                        pred_conf   = top_vals[0].item()
-                        top2_margin = (top_vals[0] - top_vals[1]).item()
-                        pred_word   = idx_to_label[top_idx[0].item()]
+                    raw_prob = run_model_probs(seq)
+                    state["prob_history"].append(raw_prob)
+                    prob = np.mean(state["prob_history"], axis=0)
 
-                        # Demo modu: top-1 whitelist disinda ise, top-15 icinde whitelist ara
-                        if state.get("demo_mode") and pred_word not in DEMO_WORDS:
-                            picked = None
-                            for v, i in zip(top_vals.tolist(), top_idx.tolist()):
-                                w = idx_to_label[i]
-                                if w in DEMO_WORDS:
-                                    picked = (w, v); break
-                            if picked is not None and picked[1] >= 0.15:
-                                pred_word = picked[0]
-                                pred_conf = picked[1]
-                            else:
-                                pred_word = ""
-                                pred_conf = 0.0
-                                top2_margin = 0.0
+                    top_idx = np.argsort(prob)[::-1][:15]
+                    top_vals = prob[top_idx]
+                    pred_conf   = float(top_vals[0])
+                    top2_margin = float(top_vals[0] - top_vals[1])
+                    pred_word   = idx_to_label[int(top_idx[0])]
 
-                        # TESHIS LOG (her 5 framede 1, server konsola yazar)
-                        if hand_visible and (int(time.time()*5) % 5 == 0):
-                            top5_str = " | ".join(
-                                f"{idx_to_label[int(i)]}:{float(v)*100:.0f}%"
-                                for v, i in list(zip(top_vals[:5].tolist(), top_idx[:5].tolist()))
-                            )
-                            print(f"[PRED] {top5_str}{'  [DEMO]' if state.get('demo_mode') else ''}", flush=True)
+                    # Demo modu: top-1 whitelist disinda ise, top-15 icinde whitelist ara
+                    if state.get("demo_mode"):
+                        demo_indices = [label_map[w] for w in DEMO_WORDS if w in label_map]
+                        demo_probs = prob[demo_indices]
+                        demo_sum = float(np.sum(demo_probs))
+                        if demo_sum >= 0.35:
+                            order = np.argsort(demo_probs)[::-1]
+                            best_i = demo_indices[int(order[0])]
+                            second_p = float(demo_probs[int(order[1])]) if len(order) > 1 else 0.0
+                            pred_word = idx_to_label[best_i]
+                            pred_conf = float(demo_probs[int(order[0])] / max(demo_sum, 1e-6)) * min(1.0, demo_sum + 0.35)
+                            top2_margin = float(demo_probs[int(order[0])] - second_p)
+                        else:
+                            pred_word = ""
+                            pred_conf = 0.0
+                            top2_margin = 0.0
+
+                    # TESHIS LOG (her 5 framede 1, server konsola yazar)
+                    if hand_visible and (int(time.time()*5) % 5 == 0):
+                        top5_str = " | ".join(
+                            f"{idx_to_label[int(i)]}:{float(v)*100:.0f}%"
+                            for v, i in list(zip(top_vals[:5].tolist(), top_idx[:5].tolist()))
+                        )
+                        print(f"[PRED] {top5_str}{'  [DEMO]' if state.get('demo_mode') else ''}", flush=True)
 
                     state["current_word"] = pred_word
                     state["current_conf"] = pred_conf
@@ -1334,7 +1366,8 @@ def handle_start():
                     needed  = SMOOTH_FAST if is_fast else SMOOTH_NEEDED
 
                     # pred_word bos ise (demo modu reddetmis) smoothing'i SIFIRLAMA
-                    if pred_word and pred_conf >= CONF_THRESHOLD and hand_visible and not in_cooldown:
+                    if (pred_word and pred_conf >= CONF_THRESHOLD and
+                        top2_margin >= MARGIN_MIN and hand_visible and not in_cooldown):
                         state["smooth_counts"][pred_word] += 1
                         for k in state["smooth_counts"]:
                             if k != pred_word:
@@ -1342,15 +1375,12 @@ def handle_start():
 
                         if state["smooth_counts"][pred_word] >= needed:
                             # ── BAGLAM TEMELLI DUZELTMELER ──
-                            # KAHVE/KAFE — model bunlari karistiriyor, baglama gore duzelt
                             if pred_word in ("KAHVE", "KAFE"):
                                 last = state["sentence"][-1] if state["sentence"] else None
                                 if last == "BERABER":
                                     pred_word = "KAHVE"   # "Beraber kahve icelim"
-                                elif last == "YAN":
+                                elif last in ("YAN", "PARK"):
                                     pred_word = "KAFE"    # "yanindaki kafede"
-                                elif last == "PARK":
-                                    pred_word = "KAFE"
                             # Ayni kelimeyi art arda ekleme
                             if not (state["sentence"] and state["sentence"][-1] == pred_word):
                                 if len(state["sentence"]) >= 20:
@@ -1361,12 +1391,10 @@ def handle_start():
                             state["smooth_counts"] = {k: 0 for k in label_map}
                             # FULL CLEAR: temiz baslangic
                             state["buffer"].clear()
+                            state["prob_history"].clear()
                     else:
                         if not hand_visible or in_cooldown:
                             state["smooth_counts"] = {k: 0 for k in label_map}
-                            # BUFFER'I TEMIZLEME — anlik detection kaybi (1 frame) bile
-                            # her seyi sifirliyordu. Sadece smoothing'i sifirla,
-                            # buffer kalsin ki bir sonraki frame'de devam etsin.
 
                 # Frame'i encode et (landmark'li)
                 _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -1400,21 +1428,21 @@ def handle_start():
 def handle_stop():
     state["running"] = False
 
-# NOT: eski handle_disconnect asagi tasindi — ws_sessions temizligi ile
-# birlestirildi. Bkz. _ws_cleanup_disconnect.
-
 # Separate state for HTTP predict_frame (mobile app)
 http_state = {
     "buffer": deque(maxlen=SEQ_LEN),
+    "prob_history": deque(maxlen=PROB_AVG_WINDOW),
+    "last_hand_time": 0.0,
+    "pause_reset_done": False,
     "holistic": None,
+    "lock": threading.Lock(),
 }
 
 @app.route("/predict_frame", methods=["POST"])
 def predict_frame():
     """HTTP endpoint for mobile app - accepts base64 image, returns prediction"""
-    import base64
     try:
-        data = request.json
+        data = request.json or {}
         image_base64 = data.get("image_base64", "")
         if not image_base64:
             return jsonify({"success": False, "error": "No image"})
@@ -1425,56 +1453,199 @@ def predict_frame():
         if img is None:
             return jsonify({"success": False, "error": "Cannot decode image"})
 
-        # Separate holistic for HTTP mode (V2 guclu ayarlar)
-        if http_state["holistic"] is None:
-            http_state["holistic"] = mp_holistic.Holistic(
-                static_image_mode=True,
-                model_complexity=2,
-                min_detection_confidence=0.3,
-                min_tracking_confidence=0.3,
-                refine_face_landmarks=False
-            )
+        # Pad portrait frame to 4:3 (640x480) to match training distribution
+        ih, iw = img.shape[:2]
+        if iw < ih:
+            target_w = int(ih * 4 / 3)
+            if target_w > iw:
+                pad_total = target_w - iw
+                pad_left  = pad_total // 2
+                pad_right = pad_total - pad_left
+                img = cv2.copyMakeBorder(img, 0, 0, pad_left, pad_right,
+                                         cv2.BORDER_CONSTANT, value=(0, 0, 0))
+            img = cv2.resize(img, (640, 480))
 
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = http_state["holistic"].process(rgb)
-        lm = extract_landmarks(results)
-        lm = normalize_landmarks(lm)              # V2: normalize
+        with http_state["lock"]:
+            if http_state["holistic"] is None:
+                http_state["holistic"] = mp_holistic.Holistic(
+                    static_image_mode=False,
+                    model_complexity=1,
+                    min_detection_confidence=0.35,
+                    min_tracking_confidence=0.45,
+                    smooth_landmarks=True,
+                    refine_face_landmarks=False
+                )
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = http_state["holistic"].process(rgb)
 
-        hand_visible = (results.left_hand_landmarks is not None or
-                        results.right_hand_landmarks is not None)
+        hand_visible = detect_active_hands(results)
+        now_t = time.time()
 
-        http_state["buffer"].append(lm)
+        if hand_visible:
+            http_state["last_hand_time"] = now_t
+            http_state["pause_reset_done"] = False
+            lm = extract_landmarks(results)
+            lm = normalize_landmarks(lm)
+            http_state["buffer"].append(lm)
+        else:
+            if (not http_state["pause_reset_done"] and http_state["last_hand_time"] > 0 and
+                (now_t - http_state["last_hand_time"]) >= INTER_SIGN_PAUSE_SEC):
+                http_state["buffer"].clear()
+                http_state["prob_history"].clear()
+                http_state["pause_reset_done"] = True
+
         buf_len = len(http_state["buffer"])
+
+        if not hand_visible:
+            return jsonify({
+                "success": True, "prediction_text": "", "confidence": 0.0,
+                "buffer_size": buf_len, "hands_detected": False,
+                "message": "Ellerinizi gösterin..."
+            })
 
         if buf_len < SEQ_LEN:
             return jsonify({
                 "success": True, "prediction_text": "", "confidence": 0.0,
-                "buffer_size": buf_len, "hands_detected": hand_visible,
-                "message": f"Buffer: {buf_len}/{SEQ_LEN}"
+                "buffer_size": buf_len, "hands_detected": True,
+                "message": f"İşaret okunuyor ({buf_len}/{SEQ_LEN})"
             })
 
         seq = np.array(http_state["buffer"], dtype=np.float32)   # (30, 1629) normalize
         seq = add_velocity(seq)                                   # (30, 1755)
         seq = np.clip(seq, -5, 5)
-        inp = torch.tensor(seq).unsqueeze(0).to(device)
 
-        with torch.no_grad():
-            out = model(inp)
-            prob = torch.softmax(out, dim=1)[0]
-            if state.get("demo_mode"):
-                # Full softmax search — whitelist icinde en yuksek
-                wl_pairs = [(prob[label_map[w]].item(), w) for w in DEMO_WORDS]
-                wl_pairs.sort(reverse=True)
-                pred_conf = wl_pairs[0][0]
-                pred_word = wl_pairs[0][1]
-            else:
-                top_vals, top_idx = prob.topk(1)
-                pred_conf = top_vals[0].item()
-                pred_word = idx_to_label[top_idx[0].item()]
+        raw_prob = run_model_probs(seq)
+        http_state["prob_history"].append(raw_prob)
+        prob = np.mean(http_state["prob_history"], axis=0)
+
+        if state.get("demo_mode"):
+            demo_indices = [label_map[w] for w in DEMO_WORDS if w in label_map]
+            demo_probs = prob[demo_indices]
+            demo_sum = float(np.sum(demo_probs))
+            order = np.argsort(demo_probs)[::-1]
+            best_i = demo_indices[int(order[0])]
+            second_p = float(demo_probs[int(order[1])]) if len(order) > 1 else 0.0
+            pred_word = idx_to_label[best_i]
+            pred_conf = float(demo_probs[int(order[0])])
+            margin = float(pred_conf - second_p)
+        else:
+            top_idx = np.argsort(prob)[::-1][:2]
+            pred_conf = float(prob[int(top_idx[0])])
+            margin = float(prob[int(top_idx[0])] - prob[int(top_idx[1])])
+            pred_word = idx_to_label[int(top_idx[0])]
+
+        if pred_conf < 0.70 or margin < 0.15:
+            pred_word = ""
+            pred_conf = 0.0
 
         return jsonify({
             "success": True, "prediction_text": pred_word, "confidence": pred_conf,
-            "buffer_size": buf_len, "hands_detected": hand_visible
+            "buffer_size": buf_len, "hands_detected": hand_visible,
+            "message": f"El algılandı • {pred_word} (%{int(pred_conf*100)})" if pred_word else "El algılandı"
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route("/predict_landmarks", methods=["POST"])
+def predict_landmarks():
+    """Accepts raw 1629 landmarks from client-side MediaPipe Holistic, normalizes, buffers, and runs V2 GRU."""
+    try:
+        data = request.json or {}
+        hand_visible = bool(data.get("hand_visible", False))
+        demo_mode = bool(data.get("demo_mode", state.get("demo_mode", False)))
+        now_t = time.time()
+
+        if not hand_visible:
+            if (not http_state["pause_reset_done"] and http_state["last_hand_time"] > 0 and
+                (now_t - http_state["last_hand_time"]) >= INTER_SIGN_PAUSE_SEC):
+                http_state["buffer"].clear()
+                http_state["prob_history"].clear()
+                http_state["pause_reset_done"] = True
+            return jsonify({
+                "success": True, "hands_detected": False,
+                "prediction_text": "", "confidence": 0.0,
+                "buffer_size": len(http_state["buffer"]),
+                "message": "Ellerinizi gösterin..."
+            })
+
+        lm_raw = data.get("landmarks")
+        if not lm_raw or len(lm_raw) != RIGHT_END:
+            return jsonify({"success": False, "error": "Invalid landmarks length"})
+
+        http_state["last_hand_time"] = now_t
+        http_state["pause_reset_done"] = False
+        lm = np.array(lm_raw, dtype=np.float32)
+        lm = normalize_landmarks(lm)
+        http_state["buffer"].append(lm)
+        buf_len = len(http_state["buffer"])
+
+        if buf_len < SEQ_LEN:
+            return jsonify({
+                "success": True, "hands_detected": True,
+                "prediction_text": "", "confidence": 0.0,
+                "buffer_size": buf_len,
+                "message": f"İşaret okunuyor ({buf_len}/{SEQ_LEN})"
+            })
+
+        seq = np.array(http_state["buffer"], dtype=np.float32)
+        seq = add_velocity(seq)
+        seq = np.clip(seq, -5, 5)
+        raw_prob = run_model_probs(seq)
+        http_state["prob_history"].append(raw_prob)
+        prob = np.mean(http_state["prob_history"], axis=0)
+
+        if demo_mode:
+            demo_indices = [label_map[w] for w in DEMO_WORDS if w in label_map]
+            demo_probs = prob[demo_indices]
+            demo_sum = float(np.sum(demo_probs))
+            if demo_sum >= 0.35:
+                order = np.argsort(demo_probs)[::-1]
+                best_i = demo_indices[int(order[0])]
+                second_p = float(demo_probs[int(order[1])]) if len(order) > 1 else 0.0
+                pred_word = idx_to_label[best_i]
+                pred_conf = float(demo_probs[int(order[0])] / max(demo_sum, 1e-6)) * min(1.0, demo_sum + 0.35)
+                margin = float(demo_probs[int(order[0])] - second_p)
+            else:
+                pred_word, pred_conf, margin = "", 0.0, 0.0
+        else:
+            top_idx = np.argsort(prob)[::-1][:2]
+            pred_conf = float(prob[int(top_idx[0])])
+            margin = float(prob[int(top_idx[0])] - prob[int(top_idx[1])])
+            pred_word = idx_to_label[int(top_idx[0])]
+
+        if pred_conf < 0.72 or margin < 0.18:
+            pred_word = ""
+            pred_conf = 0.0
+
+        return jsonify({
+            "success": True, "hands_detected": True,
+            "prediction_text": pred_word, "confidence": pred_conf, "margin": margin,
+            "buffer_size": buf_len,
+            "message": f"El algılandı • {pred_word} (%{int(pred_conf*100)})" if pred_word else "El algılandı"
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route("/predict_sequence", methods=["POST"])
+def predict_sequence():
+    """Accepts normalized (30, 1755) sequence or raw 1629 landmark frame and runs V2 GRU model."""
+    try:
+        data = request.json or {}
+        seq_flat = data.get("sequence")
+        if not seq_flat or len(seq_flat) != SEQ_LEN * INPUT_SIZE:
+            return jsonify({"success": False, "error": "Invalid sequence length"})
+        seq = np.array(seq_flat, dtype=np.float32).reshape(SEQ_LEN, INPUT_SIZE)
+        prob = run_model_probs(seq)
+        top_idx = np.argsort(prob)[::-1][:3]
+        pred_conf = float(prob[int(top_idx[0])])
+        margin = float(prob[int(top_idx[0])] - prob[int(top_idx[1])])
+        pred_word = idx_to_label[int(top_idx[0])]
+        return jsonify({
+            "success": True,
+            "prediction_text": pred_word,
+            "confidence": pred_conf,
+            "margin": margin,
+            "top3": [{"word": idx_to_label[int(i)], "conf": float(prob[int(i)])} for i in top_idx]
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
@@ -1482,39 +1653,38 @@ def predict_frame():
 @app.route("/reset_buffer", methods=["POST"])
 def reset_buffer():
     http_state["buffer"] = deque(maxlen=SEQ_LEN)
+    http_state["prob_history"] = deque(maxlen=PROB_AVG_WINDOW)
     state["buffer"] = deque(maxlen=SEQ_LEN)
+    state["prob_history"] = deque(maxlen=PROB_AVG_WINDOW)
     state["smooth_counts"] = {k: 0 for k in label_map}
     state["sentence"] = []
     # Tum WS oturumlarinin buffer'ini da sifirla (mobil istek yapan icin)
     for sess in list(ws_sessions.values()):
         sess["buffer"] = deque(maxlen=SEQ_LEN)
+        sess["prob_history"] = deque(maxlen=PROB_AVG_WINDOW)
     return jsonify({"success": True})
 
 # =========================================================================
 # WebSocket streaming endpoint (mobil icin HIZLI yol)
-# ---------------------------------------------------------------------
-# HTTP /predict_frame hep acik kaliyor (geriye donuk uyumluluk). Bu
-# ek endpoint Socket.IO uzerinden BINARY JPEG alip ayni islemi yapar ama
-# her karede yeni TCP handshake yok, base64 overhead yok, streaming
-# modunda MediaPipe (static_image_mode=False, complexity=1) kullanir.
 # =========================================================================
-ws_sessions = {}  # sid -> {"buffer": deque, "holistic": Holistic}
+ws_sessions = {}
 
 def _get_ws_session(sid):
     sess = ws_sessions.get(sid)
     if sess is None:
         sess = {
             "buffer": deque(maxlen=SEQ_LEN),
+            "prob_history": deque(maxlen=PROB_AVG_WINDOW),
+            "last_hand_time": 0.0,
+            "pause_reset_done": False,
             "holistic": mp_holistic.Holistic(
                 static_image_mode=False,
-                model_complexity=0,           # 1 -> 0 (en hafif, en hizli MediaPipe)
-                min_detection_confidence=0.3,
-                min_tracking_confidence=0.3,
+                model_complexity=0,
+                min_detection_confidence=0.35,
+                min_tracking_confidence=0.45,
                 smooth_landmarks=True,
                 refine_face_landmarks=False,
             ),
-            # Lock: MediaPipe Holistic thread-safe degil; ayni instance'a
-            # paralel .process() cagrisi timestamp mismatch -> segfault.
             "lock": threading.Lock(),
         }
         ws_sessions[sid] = sess
@@ -1522,14 +1692,8 @@ def _get_ws_session(sid):
 
 @socketio.on("ws_frame")
 def on_ws_frame(data):
-    """
-    Mobil app'ten binary JPEG frame.
-    data: bytes (tercihli) veya {"jpeg": bytes/base64, "flip": bool}
-    Flip istemcide yapilacak (ayna), sunucu ham JPEG bekler.
-    """
     try:
         sid = request.sid
-        # Binary veya dict/base64 — hepsini kabul et
         if isinstance(data, dict):
             raw = data.get("jpeg") or data.get("image_base64") or b""
             flip = bool(data.get("flip", False))
@@ -1542,7 +1706,6 @@ def on_ws_frame(data):
         elif isinstance(raw, (bytes, bytearray, memoryview)):
             jpeg = bytes(raw)
         else:
-            # List<int> (socket_io_client bazen boyle gonderir)
             try:
                 jpeg = bytes(raw)
             except Exception:
@@ -1562,15 +1725,8 @@ def on_ws_frame(data):
         if flip:
             img = cv2.flip(img, 1)
 
-        # ─── KRİTİK FIX: Eğitim verisi 4:3 landscape (640x480 webcam) ───
-        # Mobil portre 2:3 (480x720) gonderiyor → frame orani uyumsuzlugu
-        # landmark dagilimini eğitim dağılımının dışına itiyor → model BARIŞ
-        # default attractor'una duşuyor.
-        # COZUM: gelen portre'yi 4:3 landscape'e PAD et, 640x480'e resize et.
-        # Boylece holistic ile aynı orana sahip frame goruyor.
         ih, iw = img.shape[:2]
-        if iw < ih:  # portre
-            # Hedef oran 4:3 landscape => target_w = ih * 4/3
+        if iw < ih:
             target_w = int(ih * 4 / 3)
             if target_w > iw:
                 pad_total = target_w - iw
@@ -1582,56 +1738,52 @@ def on_ws_frame(data):
 
         sess = _get_ws_session(sid)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = sess["holistic"].process(rgb)
-        lm = extract_landmarks(results)
-        lm = normalize_landmarks(lm)
+        with sess["lock"]:
+            results = sess["holistic"].process(rgb)
 
-        hand_visible = (results.left_hand_landmarks is not None or
-                        results.right_hand_landmarks is not None)
+        hand_visible = detect_active_hands(results)
+        now_t = time.time()
 
-        sess["buffer"].append(lm)
+        if hand_visible:
+            sess["last_hand_time"] = now_t
+            sess["pause_reset_done"] = False
+            lm = extract_landmarks(results)
+            lm = normalize_landmarks(lm)
+            sess["buffer"].append(lm)
+        else:
+            if (not sess["pause_reset_done"] and sess["last_hand_time"] > 0 and
+                (now_t - sess["last_hand_time"]) >= INTER_SIGN_PAUSE_SEC):
+                sess["buffer"].clear()
+                sess["prob_history"].clear()
+                sess["pause_reset_done"] = True
+
         buf_len = len(sess["buffer"])
 
-        # FULL BUFFER ZORUNLU — kismi tahminler noisy/yanlis cikiyordu
-        # Model 30 frame'de %95+ guvenle dogru tahmin verir
-        if buf_len < SEQ_LEN:
+        if not hand_visible or buf_len < SEQ_LEN:
             emit("ws_pred", {
                 "success": True, "prediction_text": "", "confidence": 0.0,
                 "buffer_size": buf_len, "hands_detected": hand_visible,
-                "message": f"Buffer: {buf_len}/{SEQ_LEN}"
+                "message": f"Buffer: {buf_len}/{SEQ_LEN}" if hand_visible else "Ellerinizi gösterin..."
             })
             return
 
         seq = np.array(sess["buffer"], dtype=np.float32)
         seq = add_velocity(seq)
         seq = np.clip(seq, -5, 5)
-        inp = torch.tensor(seq).unsqueeze(0).to(device)
 
-        with torch.no_grad():
-            out = model(inp)
-            prob = torch.softmax(out, dim=1)[0]
-            if state.get("demo_mode"):
-                wl_pairs = [(prob[label_map[w]].item(), w, label_map[w]) for w in DEMO_WORDS]
-                wl_pairs.sort(reverse=True)
-                conf = torch.tensor(wl_pairs[0][0])
-                idx  = torch.tensor(wl_pairs[0][2])
-            else:
-                top1_vals, top1_idxs = prob.topk(1)
-                conf = top1_vals[0]
-                idx  = top1_idxs[0]
-            # Top-3 teshis logu
-            top3_vals, top3_idxs = prob.topk(3)
-            top3_str = " | ".join(
-                f"{idx_to_label[int(i)]} {float(v)*100:.0f}%"
-                for v, i in zip(top3_vals, top3_idxs)
-            )
+        raw_prob = run_model_probs(seq)
+        sess["prob_history"].append(raw_prob)
+        prob = np.mean(sess["prob_history"], axis=0)
 
-        label_str = idx_to_label[idx.item()]
-        conf_val  = float(conf.item())
-        # Sunucu teshis: mobilden gelen JPEG'e ne tahmin etti, hand var mi
-        print(f"WS_PRED [{sid[:6]}] {label_str} {conf_val*100:.0f}% "
-              f"hand={hand_visible} buf={buf_len} top3={top3_str}",
-              flush=True)
+        if state.get("demo_mode"):
+            wl_pairs = [(float(prob[label_map[w]]), w, label_map[w]) for w in DEMO_WORDS if w in label_map]
+            wl_pairs.sort(reverse=True)
+            conf_val = wl_pairs[0][0]
+            label_str = wl_pairs[0][1]
+        else:
+            top3_idxs = np.argsort(prob)[::-1][:3]
+            conf_val = float(prob[int(top3_idxs[0])])
+            label_str = idx_to_label[int(top3_idxs[0])]
 
         emit("ws_pred", {
             "success": True,
@@ -1651,8 +1803,8 @@ def on_ws_reset():
     sid = request.sid
     sess = ws_sessions.get(sid)
     if sess is not None:
-        # FULL CLEAR: en hizli temiz baslangic
         sess["buffer"] = deque(maxlen=SEQ_LEN)
+        sess["prob_history"] = deque(maxlen=PROB_AVG_WINDOW)
     emit("ws_pred", {"success": True, "reset": True})
 
 # ---- Faz B: landmark-only endpoint ----
@@ -1783,12 +1935,23 @@ def serve_avatar(filename):
     from flask import send_from_directory
     return send_from_directory(AVATAR_DIR, filename)
 
+@app.route("/holistic/<path:filename>")
+def serve_holistic(filename):
+    from flask import send_from_directory
+    return send_from_directory(os.path.join(AVATAR_DIR, "holistic"), filename)
+
+@app.route("/model/<path:filename>")
+def serve_model(filename):
+    from flask import send_from_directory
+    return send_from_directory(os.path.join(AVATAR_DIR, "model"), filename)
+
 @app.route("/api/list-poses")
 def list_poses():
     if os.path.exists(POSES_FILE):
         with open(POSES_FILE, "r", encoding="utf-8") as f:
-            return jsonify(json.load(f))
-    return jsonify({})
+            data = json.load(f)
+            return jsonify({"poses": data})
+    return jsonify({"poses": {}})
 
 @app.route("/api/save-pose", methods=["POST"])
 def save_pose():
