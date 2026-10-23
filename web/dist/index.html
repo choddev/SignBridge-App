@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#08090e">
+  <title>SignBridge — Türk İşaret Dili Çevirisi (YOLOv11)</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Space+Grotesk:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- TOPBAR -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+          <path d="M5 12h14M5 12l4-4M5 12l4 4M19 6v12"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <div class="brand-name">SignBridge</div>
+        <div class="brand-tag">Türk İşaret Dili — Çift yönlü çeviri (YOLOv11n)</div>
+      </div>
+    </div>
+
+    <nav class="tab-pill">
+      <button class="tab-btn active" id="tabBtnCamera" onclick="switchTab('camera')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+          <circle cx="12" cy="13" r="4"/>
+        </svg>
+        Kamera
+      </button>
+      <button class="tab-btn" id="tabBtnAvatar" onclick="switchTab('avatar')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+          <circle cx="12" cy="7" r="4"/>
+        </svg>
+        Avatar
+      </button>
+    </nav>
+
+    <div class="top-info">
+      <div class="stat-pill"><span class="dot"></span><span id="statusTop">Canlı</span></div>
+      <div class="stat-pill" id="vocabPill">122 kelime</div>
+      <div class="stat-pill">yolo11n.pt</div>
+    </div>
+  </header>
+
+  <!-- ═══════════════ KAMERA TAB (TİD → Türkçe) ═══════════════ -->
+  <section class="view-section active" id="view-camera">
+    <div class="camera-grid">
+      <div class="camera-section">
+        <div class="dual-cam">
+          <!-- Left: YOLO + Landmark Annotated Canvas -->
+          <div class="camera-wrapper">
+            <div class="camera-placeholder" id="camPlaceholder">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M15.75 10.5l4.72-4.72a.75.75 0 011.28.53v11.38a.75.75 0 01-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 002.25-2.25v-9A2.25 2.25 0 0013.5 5.25h-9A2.25 2.25 0 002.25 9.75v9A2.25 2.25 0 004.5 18.75z"/>
+              </svg>
+              <p>Kamerayı veya YOLOv11 canlı simülasyonunu başlatmak için aşağıdaki butona basın</p>
+            </div>
+            <canvas id="yoloCanvas" width="640" height="480" style="display:none;"></canvas>
+            <div class="cam-badges-top">
+              <span class="badge-pill hand-ok" id="handBadge">El algılandı</span>
+              <span class="badge-pill" id="fpsBadge">24 fps • YOLOv11n</span>
+            </div>
+            <div class="pred-overlay">
+              <span id="predWord">MERHABA</span>
+              <span id="predConf">%99</span>
+            </div>
+            <div class="conf-bar-wrap"><div id="confBar" style="width:99%"></div></div>
+            <div class="cam-label">📍 YOLO + Landmark</div>
+          </div>
+
+          <!-- Right: Raw Camera Stream -->
+          <div class="camera-wrapper">
+            <video id="rawVideo" autoplay playsinline muted style="display:none;"></video>
+            <canvas id="rawFallbackCanvas" width="640" height="480"></canvas>
+            <div class="cam-label">🎥 Ham Kamera</div>
+          </div>
+        </div>
+
+        <div class="controls">
+          <button class="btn btn-primary" id="btnStart" onclick="toggleCamera()">Kamerayı Başlat</button>
+          <button class="btn btn-success" id="btnAdd" onclick="manualAdd()">✋ Kelime Ekle (Space)</button>
+          <button class="btn btn-ghost" onclick="clearSentence()">Temizle</button>
+          <button class="btn btn-ghost" onclick="saveSentence()">Kaydet</button>
+          <button class="btn btn-cyan" onclick="speakNow()">🔊 Sesli Oku</button>
+          <label class="chk-label"><input type="checkbox" id="autoMode" checked> Otomatik Ekle</label>
+          <label class="chk-label"><input type="checkbox" id="autoSpeak" checked> Otomatik Sesli Oku</label>
+          <label class="chk-label" style="color:#22d3ee;border-color:rgba(34,211,238,0.3);">
+            <input type="checkbox" id="demoMode"> 🎯 Demo Modu (29 kelime)
+          </label>
+        </div>
+      </div>
+
+      <!-- Right Side Panel -->
+      <aside class="side-panel">
+        <div class="card">
+          <div class="card-title">İşaret Kelimeleri</div>
+          <div id="sentenceBox"></div>
+          <div id="cooldownBar"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Türkçe Cümle</div>
+          <div id="nlpBox">Merhaba baba!</div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Geçmiş Cümleler</div>
+          <div id="historyList"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">⚡ Hızlı Cümleler</div>
+          <div class="qa-grid">
+            <button class="qa-chip" onclick="addPhrase(['MERHABA','NASILSIN'])">Merhaba nasılsın</button>
+            <button class="qa-chip" onclick="addPhrase(['IYI','SEN','NE','YAPMAK'])">İyiyim sen ne yapıyorsun</button>
+            <button class="qa-chip" onclick="addPhrase(['BEN','CALISMAK','COK','YORULMAK'])">Ben çalışıyorum çok yoruldum</button>
+            <button class="qa-chip" onclick="addPhrase(['SAAT','KAC','BITMEK'])">Saat kaçta bitiyor</button>
+            <button class="qa-chip" onclick="addPhrase(['AKSAM','BES','SONRA','BOS'])">Akşam beşten sonra boşum</button>
+            <button class="qa-chip" onclick="addPhrase(['BERABER','KAHVE','ICMEK'])">Beraber kahve içelim mi</button>
+            <button class="qa-chip" onclick="addPhrase(['TAMAM','NEREDE','BULUSMAK'])">Tamam nerede buluşalım</button>
+            <button class="qa-chip" onclick="addPhrase(['PARK','YAN','KAFE'])">Parkın yanındaki kafede</button>
+            <button class="qa-chip" onclick="addPhrase(['TAMAM','GORUSMEK'])">Tamam görüşürüz</button>
+            <button class="qa-chip" onclick="addPhrase(['KENDI','IYI','BAKMAK'])">Kendine iyi bak</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <div class="card-title" style="margin-bottom:0;">Bilinen Kelimeler (YOLO + TİD)</div>
+            <span class="badge-pill" id="wordCountBadge">122</span>
+          </div>
+          <input class="word-search" id="wordSearch" placeholder="Kelime ara..." oninput="filterWords()">
+          <div id="wordList"></div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ═══════════════ AVATAR TAB (Türkçe → TİD) ═══════════════ -->
+  <section class="view-section" id="view-avatar">
+    <div class="avatar-layout">
+      <div class="avatar-topbar">
+        <span class="brand-name" style="font-size:1rem;">SignBridge</span>
+        <span class="gloss-pill" style="font-size:0.7rem;">Avatar</span>
+        <input class="avatar-input" id="avatarSentenceInput" value="merhaba baba" placeholder="Türkçe cümle yaz...">
+        <button class="btn btn-primary" onclick="playAvatarSentence()">Cümle Oynat</button>
+        <input class="avatar-input" id="avatarWordInput" value="BABA" style="min-width:130px;" placeholder="Kelime...">
+        <button class="btn btn-ghost" onclick="playSingleAvatarWord()">Kelime</button>
+        <button class="btn btn-ghost" onclick="stopAvatar()">Dur</button>
+        <button class="btn btn-cyan" onclick="startAvatarMic()" title="Sesle Yaz (STT)">🎤 Mikrofon</button>
+        <div style="display:flex;align-items:center;gap:8px;margin-left:auto;font-size:0.82rem;color:#94a3b8;">
+          <span>Hız</span>
+          <input type="range" id="avatarSpeed" min="0.4" max="2.0" step="0.1" value="1.0" oninput="updateAvatarSpeed(this.value)">
+          <span id="avatarSpeedVal" style="color:#a78bfa;font-weight:800;">1.0x</span>
+        </div>
+      </div>
+
+      <div class="quick-bar">
+        <span style="font-size:0.72rem;font-weight:800;color:#a78bfa;text-transform:uppercase;">⚡ Hızlı:</span>
+        <button class="qp-chip" onclick="playQuickAvatar('Merhaba nasılsın')">Merhaba nasılsın</button>
+        <button class="qp-chip" onclick="playQuickAvatar('İyiyim sen ne yapıyorsun')">İyiyim sen ne yapıyorsun</button>
+        <button class="qp-chip" onclick="playQuickAvatar('Ben çalışıyorum çok yoruldum')">Ben çalışıyorum çok yoruldum</button>
+        <button class="qp-chip" onclick="playQuickAvatar('Beraber kahve içelim mi')">Beraber kahve içelim mi</button>
+        <button class="qp-chip" onclick="playQuickAvatar('Tamam nerede buluşalım')">Tamam nerede buluşalım</button>
+        <button class="qp-chip" onclick="playQuickAvatar('Kendine iyi bak')">Kendine iyi bak</button>
+      </div>
+
+      <div class="avatar-stage-wrap">
+        <div class="avatar-canvas-col">
+          <canvas id="avatarCanvas" width="760" height="540"></canvas>
+          <div id="avatarWordDisplay">BABA</div>
+          <div id="avatarStatusBadge">Oynatılıyor: BABA</div>
+          <div id="avatarProgressBar" style="width:65%"></div>
+        </div>
+        <aside class="avatar-sidebar">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <span class="card-title" style="margin-bottom:0;">KELİMELER</span>
+            <span class="badge-pill">122 POZ</span>
+          </div>
+          <input class="word-search" id="poseSearch" placeholder="Poz ara..." oninput="filterPoses()">
+          <div class="pose-list" id="poseList"></div>
+          <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06);font-size:0.75rem;color:#64748b;">
+            <div id="avatarAnimLabel">Anim: BABA</div>
+            <div>Toplam: 122</div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>SignBridge Mobile</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { height: 100%; background: #f8fafc; color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; overflow: hidden; }
+    #app { display: flex; flex-direction: column; height: 100%; }
+
+    /* Top Header (matches mobile_camera.png & mobile_avatar.png) */
+    .topbar {
+      display: flex; align-items: center; justify-content: center;
+      padding: 12px 16px; background: #ffffff;
+      border-bottom: 1px solid #e2e8f0; position: relative; flex-shrink: 0;
+      gap: 10px;
+    }
+    .logo-box {
+      width: 34px; height: 34px; border-radius: 10px;
+      background: #5b4fe9; color: #fff;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.1rem; font-weight: 800;
+    }
+    .app-title { font-size: 1.25rem; font-weight: 800; color: #1e293b; letter-spacing: -0.02em; }
+    .conn-pill {
+      padding: 4px 10px; border-radius: 999px;
+      background: #e6f9f0; color: #10b981;
+      font-size: 0.75rem; font-weight: 700;
+      display: flex; align-items: center; gap: 5px;
+    }
+    .conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #10b981; }
+    .top-icons {
+      margin-left: auto; display: flex; align-items: center; gap: 12px; color: #64748b;
+    }
+    .icon-btn {
+      background: none; border: none; color: #64748b; font-size: 1.15rem; cursor: pointer;
+    }
+
+    /* Screens */
+    .screen { display: none; flex: 1; flex-direction: column; padding: 12px 14px; gap: 10px; overflow-y: auto; }
+    .screen.active { display: flex; }
+
+    /* CAMERA SCREEN */
+    .cam-card {
+      position: relative; flex: 1; min-height: 310px;
+      background: #1e293b; border-radius: 22px; overflow: hidden;
+      box-shadow: 0 8px 24px rgba(15,23,42,0.12);
+    }
+    .cam-card canvas, .cam-card video {
+      width: 100%; height: 100%; object-fit: cover; display: block;
+    }
+    .cam-top-row {
+      position: absolute; top: 12px; left: 12px; right: 12px;
+      display: flex; justify-content: space-between; align-items: center; z-index: 4;
+    }
+    .pill-green {
+      background: #22c55e; color: #fff; padding: 5px 12px;
+      border-radius: 999px; font-size: 0.75rem; font-weight: 700;
+    }
+    .top-right-badges { display: flex; gap: 6px; }
+    .pill-dark {
+      background: rgba(15,23,42,0.85); color: #fff; padding: 5px 10px;
+      border-radius: 999px; font-size: 0.72rem; font-weight: 700;
+    }
+    .pill-ws {
+      background: #5b4fe9; color: #fff; padding: 5px 10px;
+      border-radius: 999px; font-size: 0.72rem; font-weight: 700;
+    }
+    .pred-banner {
+      position: absolute; top: 52px; left: 50%; transform: translateX(-50%);
+      background: rgba(91,79,233,0.92); color: #fff;
+      padding: 10px 24px; border-radius: 16px;
+      font-size: 1.15rem; font-weight: 800;
+      box-shadow: 0 8px 20px rgba(91,79,233,0.4);
+      z-index: 4; white-space: nowrap;
+    }
+    .cam-bottom-row {
+      position: absolute; bottom: 12px; left: 12px; right: 12px;
+      display: flex; justify-content: space-between; align-items: center; z-index: 4;
+    }
+    .pill-live {
+      background: #ef4444; color: #fff; padding: 6px 13px;
+      border-radius: 999px; font-size: 0.74rem; font-weight: 800;
+    }
+    .bottom-right-btns { display: flex; gap: 8px; align-items: center; }
+    .pill-demo {
+      background: #06b6d4; color: #fff; border: 1.5px solid rgba(255,255,255,0.7);
+      padding: 6px 13px; border-radius: 999px; font-size: 0.74rem; font-weight: 700; cursor: pointer;
+    }
+    .btn-flip {
+      width: 36px; height: 36px; border-radius: 50%;
+      background: rgba(15,23,42,0.65); color: #fff; border: none;
+      font-size: 1rem; cursor: pointer;
+    }
+
+    /* Recognized Words Card */
+    .words-card {
+      background: #ffffff; border: 1px solid #e2e8f0;
+      border-radius: 18px; padding: 12px 14px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.03);
+    }
+    .words-header {
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 0.78rem; font-weight: 700; color: #64748b; margin-bottom: 8px;
+    }
+    .word-chips-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+    .word-chip-pill {
+      background: #5b4fe9; color: #fff; padding: 5px 14px;
+      border-radius: 999px; font-size: 0.82rem; font-weight: 700;
+    }
+    .nlp-sentence { font-size: 0.98rem; font-weight: 600; color: #0f172a; }
+
+    /* Stop / Start Button */
+    .btn-main-action {
+      width: 100%; padding: 14px; border-radius: 16px; border: none;
+      background: #ef4444; color: #fff; font-size: 1rem; font-weight: 800;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      cursor: pointer; box-shadow: 0 6px 16px rgba(239,68,68,0.28);
+    }
+    .btn-main-action.stopped { background: #5b4fe9; box-shadow: 0 6px 16px rgba(91,79,233,0.28); }
+
+    /* AVATAR SCREEN */
+    .avatar-card {
+      position: relative; flex: 1; min-height: 310px;
+      background: linear-gradient(180deg, #9499c2 0%, #686d99 72%, #322456 100%);
+      border-radius: 22px; overflow: hidden;
+    }
+    .avatar-card canvas { width: 100%; height: 100%; display: block; }
+    .vocab-pill-top {
+      position: absolute; top: 12px; right: 12px;
+      background: rgba(255,255,255,0.92); color: #5b4fe9;
+      padding: 6px 13px; border-radius: 999px; font-size: 0.76rem; font-weight: 800;
+    }
+    .avatar-progress {
+      position: absolute; bottom: 0; left: 0; height: 4px; width: 40%;
+      background: #06b6d4; transition: width 0.15s;
+    }
+    .avatar-sub {
+      text-align: center; font-size: 0.9rem; font-weight: 600;
+      color: #64748b; font-style: italic;
+    }
+    .speed-row {
+      display: flex; align-items: center; gap: 10px; font-size: 0.82rem; font-weight: 700; color: #475569;
+    }
+    .speed-row input[type=range] { flex: 1; accent-color: #5b4fe9; }
+    .speed-badge {
+      background: #ede9fe; color: #5b4fe9; padding: 4px 10px;
+      border-radius: 10px; font-size: 0.76rem; font-weight: 800;
+    }
+    .quick-scroll {
+      display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px;
+    }
+    .quick-scroll::-webkit-scrollbar { display: none; }
+    .q-btn {
+      flex-shrink: 0; padding: 8px 14px; border-radius: 12px;
+      background: #f1f0ff; border: 1px solid #d8d4fc;
+      color: #4f46e5; font-size: 0.8rem; font-weight: 700; cursor: pointer;
+    }
+    .input-row { display: flex; gap: 8px; align-items: center; }
+    .txt-input {
+      flex: 1; padding: 13px 16px; border-radius: 16px;
+      border: 1px solid #e2e8f0; background: #fff;
+      font-size: 0.95rem; color: #0f172a; outline: none;
+    }
+    .btn-mic {
+      width: 48px; height: 48px; border-radius: 15px; border: none;
+      background: #0891b2; color: #fff; font-size: 1.15rem; cursor: pointer;
+    }
+    .btn-send {
+      width: 48px; height: 48px; border-radius: 15px; border: none;
+      background: #5b4fe9; color: #fff; font-size: 1.1rem; cursor: pointer;
+    }
+
+    /* Bottom Navigation */
+    .bottom-nav {
+      display: flex; gap: 10px; padding: 8px 14px 12px;
+      background: #ffffff; border-top: 1px solid #e2e8f0; flex-shrink: 0;
+    }
+    .nav-item {
+      flex: 1; padding: 10px 0; border-radius: 16px; border: none;
+      background: transparent; color: #94a3b8;
+      display: flex; flex-direction: column; align-items: center; gap: 4px;
+      font-size: 0.78rem; font-weight: 700; cursor: pointer;
+    }
+    .nav-item.active {
+      background: #eeedfd; color: #5b4fe9;
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+  <!-- TOPBAR -->
+  <header class="topbar">
+    <div class="logo-box">🤟</div>
+    <div class="app-title">SignBridge</div>
+    <div class="conn-pill"><span class="conn-dot"></span><span>Bağlı</span></div>
+    <div class="top-icons">
+      <button class="icon-btn" onclick="cycleWord()" title="Sonraki İşaret (YOLOv11)">🐞</button>
+      <button class="icon-btn" onclick="showModelInfo()" title="YOLO Model Bilgisi">⚙️</button>
+    </div>
+  </header>
+
+  <!-- KAMERA SCREEN -->
+  <main class="screen active" id="screen-camera">
+    <div class="cam-card">
+      <canvas id="mobileCamCanvas" width="480" height="520"></canvas>
+      <div class="cam-top-row">
+        <span class="pill-green" id="mobHandBadge">El algılandı</span>
+        <div class="top-right-badges">
+          <span class="pill-dark" id="mobFpsBadge">14fps</span>
+          <span class="pill-ws">WS✓</span>
+        </div>
+      </div>
+      <div class="pred-banner" id="mobPredBanner">Merhaba %99</div>
+      <div class="cam-bottom-row">
+        <span class="pill-live" id="mobLivePill">● CANLI</span>
+        <div class="bottom-right-btns">
+          <button class="pill-demo" onclick="cycleWord()">▼ Demo (29)</button>
+          <button class="btn-flip" onclick="cycleWord()">🔄</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="words-card">
+      <div class="words-header">
+        <span>文A Tanınan Kelimeler</span>
+        <span style="cursor:pointer;font-size:1rem;" onclick="clearMobileWords()">✕</span>
+      </div>
+      <div class="word-chips-row" id="mobWordChips">
+        <span class="word-chip-pill">Merhaba</span>
+      </div>
+      <div class="nlp-sentence" id="mobSentenceText">Merhaba....</div>
+    </div>
+
+    <button class="btn-main-action" id="mobToggleBtn" onclick="toggleMobileStream()">
+      <span>⏹ Durdur</span>
+    </button>
+  </main>
+
+  <!-- AVATAR SCREEN -->
+  <main class="screen" id="screen-avatar">
+    <div class="avatar-card">
+      <canvas id="mobileAvatarCanvas" width="480" height="520"></canvas>
+      <div class="vocab-pill-top">≣ 123 kelime</div>
+      <div class="avatar-progress" id="mobAvatarProg"></div>
+    </div>
+    <div class="avatar-sub" id="mobAvatarSub">Merhaba</div>
+
+    <div class="speed-row">
+      <span>⏲ Hız</span>
+      <input type="range" min="0.4" max="2.0" step="0.1" value="0.4" oninput="setMobSpeed(this.value)">
+      <span class="speed-badge" id="mobSpeedBadge">0.4x</span>
+    </div>
+
+    <div class="quick-scroll">
+      <button class="q-btn" onclick="playMobPhrase('Merhaba nasılsın')">Merhaba nasılsın</button>
+      <button class="q-btn" onclick="playMobPhrase('İyiyim sen ne yapıyorsun')">İyiyim sen ne yapıyorsun</button>
+      <button class="q-btn" onclick="playMobPhrase('Ben çalışıyorum çok yoruldum')">Ben çalışıyorum</button>
+      <button class="q-btn" onclick="playMobPhrase('Beraber kahve içelim mi')">Beraber kahve içelim mi</button>
+    </div>
+
+    <div class="input-row">
+      <input class="txt-input" id="mobAvatarInput" value="Merhaba" placeholder="Türkçe metin yazın...">
+      <button class="btn-mic" onclick="playMobFromInput()">🎤</button>
+      <button class="btn-send" onclick="playMobFromInput()">▶</button>
+    </div>
+  </main>
+
+  <!-- BOTTOM NAV -->
+  <nav class="bottom-nav">
+    <button class="nav-item active" id="navKamera" onclick="switchMobTab('camera')">
+      <span style="font-size:1.15rem;">📹</span>
+      <span>Kamera</span>
+    </button>
+    <button class="nav-item" id="navAvatar" onclick="switchMobTab('avatar')">
+      <span style="font-size:1.15rem;">🧍</span>
+      <span>Avatar</span>
+    </button>
+  </nav>
+</div>
+
+<script>
+  const DEMO_WORDS = ['Merhaba', 'Nasılsın', 'Baba', 'Anne', 'Teşekkürler', 'Evet', 'İyi', 'Tamam'];
+  let wordIdx = 0;
+  let recognized = ['Merhaba'];
+  let streamActive = true;
+  let avatarWord = 'Merhaba';
+  let mobSpeed = 0.4;
+  let tick = 0;
+
+  function switchMobTab(tab) {
+    document.getElementById('screen-camera').classList.toggle('active', tab === 'camera');
+    document.getElementById('screen-avatar').classList.toggle('active', tab === 'avatar');
+    document.getElementById('navKamera').classList.toggle('active', tab === 'camera');
+    document.getElementById('navAvatar').classList.toggle('active', tab === 'avatar');
+  }
+
+  function cycleWord() {
+    wordIdx = (wordIdx + 1) % DEMO_WORDS.length;
+    const w = DEMO_WORDS[wordIdx];
+    document.getElementById('mobPredBanner').textContent = w + ' %99';
+    if (recognized[recognized.length - 1] !== w) {
+      recognized.push(w);
+      if (recognized.length > 5) recognized.shift();
+    }
+    renderMobWords();
+  }
+
+  function clearMobileWords() {
+    recognized = [];
+    renderMobWords();
+  }
+
+  function renderMobWords() {
+    const row = document.getElementById('mobWordChips');
+    const txt = document.getElementById('mobSentenceText');
+    if (recognized.length === 0) {
+      row.innerHTML = '';
+      txt.textContent = 'Henüz kelime algılanmadı...';
+    } else {
+      row.innerHTML = recognized.map(w => `<span class="word-chip-pill">${w}</span>`).join('');
+      txt.textContent = recognized.join(' ') + '....';
+    }
+  }
+
+  function toggleMobileStream() {
+    streamActive = !streamActive;
+    const btn = document.getElementById('mobToggleBtn');
+    if (streamActive) {
+      btn.className = 'btn-main-action';
+      btn.innerHTML = '<span>⏹ Durdur</span>';
+    } else {
+      btn.className = 'btn-main-action stopped';
+      btn.innerHTML = '<span>▶ Başlat</span>';
+    }
+  }
+
+  function setMobSpeed(v) {
+    mobSpeed = parseFloat(v) || 0.4;
+    document.getElementById('mobSpeedBadge').textContent = mobSpeed.toFixed(1) + 'x';
+  }
+
+  function playMobPhrase(p) {
+    document.getElementById('mobAvatarInput').value = p;
+    avatarWord = p;
+    document.getElementById('mobAvatarSub').textContent = p;
+  }
+
+  function playMobFromInput() {
+    const val = document.getElementById('mobAvatarInput').value || 'Merhaba';
+    avatarWord = val;
+    document.getElementById('mobAvatarSub').textContent = val;
+  }
+
+  function showModelInfo() {
+    if (window.SignBridgeNative && window.SignBridgeNative.GetYoloInfo) {
+      alert(window.SignBridgeNative.GetYoloInfo());
+    } else {
+      alert('SignBridge Android — YOLOv11n (yolo11n.pt) • 20 YOLO Sınıfı / 122 TİD Kelime');
+    }
+  }
+
+  function animateMobile() {
+    tick += 0.04;
+    // Draw Camera Preview + YOLO Box + Hand Skeleton
+    const camC = document.getElementById('mobileCamCanvas');
+    if (camC) {
+      const ctx = camC.getContext('2d');
+      const grad = ctx.createLinearGradient(0, 0, 0, 520);
+      grad.addColorStop(0, '#334155');
+      grad.addColorStop(1, '#0f172a');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, 480, 520);
+
+      // Person silhouette + signing hand
+      ctx.fillStyle = '#475569';
+      ctx.beginPath(); ctx.arc(240, 210, 68, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#e2e8f0';
+      ctx.beginPath(); ctx.roundRect(120, 290, 240, 230, 50); ctx.fill();
+
+      // Raising right arm for "Merhaba" salute
+      const hx = 310 + Math.sin(tick) * 10;
+      const hy = 155 + Math.cos(tick) * 8;
+      ctx.strokeStyle = '#d6a384';
+      ctx.lineWidth = 24;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(330, 320);
+      ctx.lineTo(395, 250);
+      ctx.lineTo(hx, hy);
+      ctx.stroke();
+
+      // YOLO bounding box
+      ctx.strokeStyle = '#a78bfa';
+      ctx.lineWidth = 2.5;
+      ctx.strokeRect(85, 110, 325, 360);
+    }
+
+    // Draw 3D-Style Avatar Character (matches mobile_avatar.png)
+    const avC = document.getElementById('mobileAvatarCanvas');
+    if (avC) {
+      const ctx = avC.getContext('2d');
+      ctx.clearRect(0, 0, 480, 520);
+
+      // Floor
+      ctx.fillStyle = '#2e2249';
+      ctx.beginPath();
+      ctx.ellipse(240, 465, 220, 55, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Legs (dark jeans)
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = '#0c1e35';
+      ctx.lineWidth = 26;
+      ctx.beginPath(); ctx.moveTo(216, 295); ctx.lineTo(212, 445); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(264, 295); ctx.lineTo(268, 445); ctx.stroke();
+
+      // Shoes
+      ctx.fillStyle = '#9a3412';
+      ctx.beginPath(); ctx.ellipse(210, 458, 18, 10, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(270, 458, 18, 10, 0, 0, Math.PI * 2); ctx.fill();
+
+      // White sleeveless top
+      ctx.fillStyle = '#f1f5f9';
+      ctx.beginPath(); ctx.roundRect(198, 165, 84, 135, 22); ctx.fill();
+
+      // Cyan scarf
+      ctx.strokeStyle = '#0891b2';
+      ctx.lineWidth = 11;
+      ctx.beginPath(); ctx.moveTo(215, 168); ctx.quadraticCurveTo(240, 184, 265, 168); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(245, 176); ctx.lineTo(250, 232); ctx.stroke();
+
+      // Head & Neck
+      ctx.fillStyle = '#5c3a21';
+      ctx.fillRect(228, 138, 24, 32);
+      ctx.beginPath(); ctx.arc(240, 102, 40, 0, Math.PI * 2); ctx.fill();
+
+      // Hair
+      ctx.fillStyle = '#1a110b';
+      ctx.beginPath(); ctx.arc(240, 90, 42, Math.PI * 0.92, Math.PI * 2.08); ctx.fill();
+
+      // Eyes
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(225, 102, 8, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(255, 102, 8, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#291709';
+      ctx.beginPath(); ctx.arc(225, 102, 4.5, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(255, 102, 4.5, 0, Math.PI * 2); ctx.fill();
+
+      // Signing Right Arm (Salute / Sign pose)
+      const wave = Math.sin(tick * (mobSpeed * 2.2)) * 12;
+      ctx.strokeStyle = '#5c3a21';
+      ctx.lineWidth = 17;
+      ctx.beginPath();
+      ctx.moveTo(198, 182);
+      ctx.lineTo(155, 152 + wave * 0.4);
+      ctx.lineTo(195, 86 + wave * 0.5);
+      ctx.stroke();
+
+      // Left Arm
+      ctx.beginPath();
+      ctx.moveTo(282, 182);
+      ctx.lineTo(295, 250);
+      ctx.lineTo(292, 315);
+      ctx.stroke();
+    }
+
+    requestAnimationFrame(animateMobile);
+  }
+  requestAnimationFrame(animateMobile);
+</script>
+</body>
+</html>

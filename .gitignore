@@ -1,0 +1,14 @@
+# Dependencies & virtual environments
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Android build caches
+android/obj/
+android/.vs/
+*.user
+*.suo
+
+android/bin/
+
