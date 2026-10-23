@@ -1,9 +1,0 @@
-{
-  "name": "SignBridge — Türk İşaret Dili Çevirisi",
-  "short_name": "SignBridge",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#08090e",
-  "theme_color": "#6c63ff",
-  "description": "Türk İşaret Dili ↔ Türkçe Çift Yönlü Gerçek Zamanlı Çeviri Sistemi (YOLOv11)"
-}
